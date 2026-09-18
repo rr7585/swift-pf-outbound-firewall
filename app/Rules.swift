@@ -17,6 +17,11 @@ enum Paths {
     static let startupLog = dataDir + "/startup.log"
     /// 守护进程每次处理完写在这里，GUI 靠它知道免密保存到底生效没有。
     static let applyStatus = dataDir + "/apply-status.txt"
+    /// 高级选项（局域网、DHCP 等内置放行开关）。和白名单一样 admin 组可写。
+    static let options = dataDir + "/options.conf"
+    /// 守护脚本合成的最终地址表：内置条目 + 用户白名单。pf 实际读的是这一份。
+    /// 它由守护脚本生成，不受 WatchPaths 监视，所以不会自触发。
+    static let effectiveList = dataDir + "/effective.txt"
     /// 上次成功加载进内核的那份 rules.conf 的校验和。
     /// 用来判断这次触发只是白名单变了（快路径），还是规则集本身变了（全量重载）。
     static let loadedRulesHash = dataDir + "/rules.loaded"
@@ -43,6 +48,50 @@ func shellWrite(_ content: String, to path: String) -> String {
 }
 
 // ============================================================================
+// 高级选项
+// ============================================================================
+
+/// 几乎人人都需要、但又不该塞进用户白名单的内置放行项。
+/// 做成开关：默认开，想收紧的人可以关掉。
+struct FirewallOptions: Equatable {
+    var allowLAN = true
+    var allowDHCP = true
+
+    /// 私有网段。访问路由器后台、NAS、局域网打印机都要靠它。
+    static let lanEntries = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    /// DHCP 广播地址。不放行的话，租约到期或重连 Wi-Fi 时拿不到 IP。
+    static let dhcpEntries = ["255.255.255.255"]
+
+    var builtinEntries: [String] {
+        (allowLAN ? Self.lanEntries : []) + (allowDHCP ? Self.dhcpEntries : [])
+    }
+
+    /// 单行 key=value，0/1。格式刻意做得简单，守护脚本用 sed 就能读。
+    func serialized() -> String {
+        "lan=\(allowLAN ? 1 : 0)\ndhcp=\(allowDHCP ? 1 : 0)\n"
+    }
+
+    /// 认不出来的键忽略，缺失的键按默认值（开）处理 —— 文件损坏或来自旧版本时
+    /// 宁可多放行也不要突然把用户的局域网掐了。
+    static func parse(_ text: String) -> FirewallOptions {
+        var options = FirewallOptions()
+        for line in text.components(separatedBy: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1).map {
+                $0.trimmingCharacters(in: .whitespaces)
+            }
+            guard parts.count == 2 else { continue }
+            let on = parts[1] != "0"
+            switch parts[0] {
+            case "lan": options.allowLAN = on
+            case "dhcp": options.allowDHCP = on
+            default: break
+            }
+        }
+        return options
+    }
+}
+
+// ============================================================================
 // PF 规则
 // ============================================================================
 
@@ -64,7 +113,7 @@ let maxUtunIndex = 31
 ///
 /// 表里 IPv4 和 IPv6 可以混着放，`pass out quick to <表>` 不指定地址族时
 /// 两种都匹配；兜底的 block 同理，所以 IPv6 也不会泄漏。
-func pfRules(allowlistPath: String) -> String {
+func pfRules(allowlistPath: String = Paths.effectiveList) -> String {
     let utuns = (0...maxUtunIndex).map { "utun\($0)" }.joined(separator: " ")
     let lines = [
         // 回环必须用 set skip 整个跳过 pf，不能写成 pass out quick on lo0。
@@ -152,6 +201,11 @@ func daemonScript() -> String {
     let hashPath = shellQuote(Paths.loadedRulesHash)
     let beforePath = shellQuote(Paths.dataDir + "/table.before")
     let afterPath = shellQuote(Paths.dataDir + "/table.after")
+    let optionsPath = shellQuote(Paths.options)
+    let effectivePath = shellQuote(Paths.effectiveList)
+    let effectiveTempPath = shellQuote(Paths.effectiveList + ".new")
+    let lanEntries = FirewallOptions.lanEntries.joined(separator: " ")
+    let dhcpEntries = FirewallOptions.dhcpEntries.joined(separator: " ")
     let loadRules = pfLoadCommand(onFailure: "report fail \"加载 PF 规则失败\"; exit 1")
     return """
     #!/bin/sh
@@ -168,6 +222,24 @@ func daemonScript() -> String {
         /bin/mv \(statusTempPath) \(statusPath)
         /bin/chmod 644 \(statusPath)
     }
+
+    # 把「内置条目（按高级选项）+ 用户白名单」合成成 pf 真正去读的那份表。
+    # 缺失的开关按开处理：文件损坏或来自旧版本时，宁可多放行也不要突然
+    # 把用户的局域网掐掉。
+    opt() {
+        value=$(/usr/bin/sed -n "s/^$1=//p" \(optionsPath) 2>/dev/null | /usr/bin/tail -1)
+        if [ -n "$value" ]; then echo "$value"; else echo 1; fi
+    }
+    : > \(effectiveTempPath)
+    if [ "$(opt lan)" != 0 ]; then
+        for entry in \(lanEntries); do echo "$entry" >> \(effectiveTempPath); done
+    fi
+    if [ "$(opt dhcp)" != 0 ]; then
+        for entry in \(dhcpEntries); do echo "$entry" >> \(effectiveTempPath); done
+    fi
+    /bin/cat \(listPath) >> \(effectiveTempPath) 2>/dev/null
+    /bin/mv \(effectiveTempPath) \(effectivePath)
+    /bin/chmod 644 \(effectivePath)
 
     # 先干跑校验。不通过就原样退出 —— 内核里还是上一份规则，
     # 也就是说白名单写错了只会“没生效”，不会把网络锁死。
@@ -198,7 +270,7 @@ func daemonScript() -> String {
         # 不碰规则集、不清状态，所以现有连接一条都不会断。
         /sbin/pfctl -t vpn_allowlist -T show 2>/dev/null \\
             | /usr/bin/sed 's/^[[:space:]]*//' | /usr/bin/sort > \(beforePath)
-        if ! /sbin/pfctl -t vpn_allowlist -T replace -f \(listPath); then
+        if ! /sbin/pfctl -t vpn_allowlist -T replace -f \(effectivePath); then
             report fail "更新白名单失败"
             exit 1
         fi
@@ -242,7 +314,7 @@ func daemonPlist() -> String {
     <key>Label</key><string>\(Paths.serviceID)</string>
     <key>ProgramArguments</key><array><string>/bin/sh</string><string>\(Paths.startup)</string></array>
     <key>RunAtLoad</key><true/>
-    <key>WatchPaths</key><array><string>\(Paths.allowlist)</string></array>
+    <key>WatchPaths</key><array><string>\(Paths.allowlist)</string><string>\(Paths.options)</string></array>
     <key>ThrottleInterval</key><integer>1</integer>
     </dict></plist>
 
@@ -263,6 +335,11 @@ func installScript() -> String {
         // 清掉旧哈希，保证装完第一次跑守护脚本走全量加载而不是快路径
         "/bin/rm -f \(shellQuote(Paths.loadedRulesHash))",
         "/usr/bin/touch \(shellQuote(Paths.allowlist))",
+        // 已存在就不覆盖，保留用户的开关选择
+        "/bin/test -f \(shellQuote(Paths.options)) || "
+            + shellWrite(FirewallOptions().serialized(), to: Paths.options),
+        "/usr/sbin/chown root:admin \(shellQuote(Paths.options))",
+        "/bin/chmod 664 \(shellQuote(Paths.options))",
         shellWrite(pfRules(allowlistPath: Paths.allowlist), to: Paths.rules),
         // 白名单交给 admin 组可写，GUI 就能免密改它，由 WatchPaths 触发重载。
         // 目录本身保持 root:wheel 755 —— root 执行的 startup.sh 就在里面，
@@ -285,15 +362,28 @@ func installScript() -> String {
     return lines.joined(separator: "\n") + "\n"
 }
 
-/// 卸载：停服务、清 PF、删掉所有落地文件。每一步都容错，半装状态也能卸干净。
-func uninstallScript() -> String {
-    let lines = [
+/// 卸载：停服务、清 PF、删掉落地文件。每一步都容错，半装状态也能卸干净。
+///
+/// keepConfig 为 true 时保留 allowlist.txt —— 白名单往往是用户一条条试出来的，
+/// 删掉重配代价很高。安装脚本对已存在的白名单只 touch 不覆盖，所以留着它
+/// 下次安装就能直接沿用。其余运行期文件照删，避免残留旧状态。
+func uninstallScript(keepConfig: Bool) -> String {
+    var lines = [
         "/bin/launchctl bootout system/\(Paths.serviceID) 2>/dev/null || true",
         "/sbin/pfctl -F all 2>/dev/null || true",
         "/sbin/pfctl -d 2>/dev/null || true",
-        "/bin/rm -rf \(shellQuote(Paths.dataDir))",
         "/bin/rm -f \(shellQuote(Paths.daemonPlist))",
+        "/bin/rm -f \(shellQuote(Paths.disabledMarker))",
     ]
+    if keepConfig {
+        for path in [Paths.rules, Paths.startup, Paths.installMarker,
+                     Paths.startupLog, Paths.applyStatus, Paths.loadedRulesHash,
+                     Paths.effectiveList] {
+            lines.append("/bin/rm -f \(shellQuote(path))")
+        }
+    } else {
+        lines.append("/bin/rm -rf \(shellQuote(Paths.dataDir))")
+    }
     return lines.joined(separator: "\n") + "\n"
 }
 

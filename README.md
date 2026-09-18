@@ -104,7 +104,9 @@ fe80::1%en0
 
 | 路径 | 说明 |
 | --- | --- |
-| `/Library/Application Support/PFOutboundFirewall/allowlist.txt` | 白名单 |
+| `/Library/Application Support/PFOutboundFirewall/allowlist.txt` | 用户白名单（界面里编辑的那份） |
+| `/Library/Application Support/PFOutboundFirewall/options.conf` | 高级选项开关，和白名单一样 admin 组可写 |
+| `/Library/Application Support/PFOutboundFirewall/effective.txt` | 守护脚本合成的最终地址表 = 内置条目 + 用户白名单，pf 实际读这一份 |
 | `/Library/Application Support/PFOutboundFirewall/rules.conf` | 生成的 PF 规则 |
 | `/Library/Application Support/PFOutboundFirewall/startup.sh` | 守护脚本（开机 + 白名单变更共用） |
 | `/Library/Application Support/PFOutboundFirewall/startup.log` | 守护脚本日志 |
@@ -127,6 +129,20 @@ AppleScript 字面量，所以只剩 shell 一层引用要管，由 `shellQuote`
 脚本碰一下就会把自己再次触发，无限循环烧 CPU。测试里锁了这条
 （`testDaemonScriptNeverWritesAllowlist`）。同理，脚本的每条退出路径都必须写
 `apply-status.txt`，否则 GUI 只能一直等到超时。
+
+**局域网和 DHCP 做成高级选项，不要混进用户白名单**。这两类是几乎人人都要、
+又跟具体用途无关的基础设施条目，塞在白名单里只会喧宾夺主。做成开关后，
+守护脚本按开关把内置条目和用户白名单合成 `effective.txt`，pf 读的是合成结果。
+
+合成表由守护脚本生成，**绝不能加进 `WatchPaths`** —— 否则又是自触发死循环。
+被监视的是 `allowlist.txt` 和 `options.conf` 两个输入文件。
+
+选项文件解析不出来时一律按「开」处理：文件损坏或来自旧版本时，
+宁可多放行也不要突然把用户的局域网掐掉。
+
+**开启防护前要预检**。默认路由走隧道、而白名单里一个公网地址都没有时，
+开防护会连同通往 VPN 节点的连接一起阻断，隧道断开、整台机器失去网络。
+这个坑在开发期间实际踩到过两次，所以界面在这种情况下会先警告再确认。
 
 **改白名单走 `pfctl -T replace`，不要重载整个规则集**。守护脚本会先判断这次触发
 是不是「只有白名单变了」—— pf 已启用、表已存在、且内核里加载的就是当前这份

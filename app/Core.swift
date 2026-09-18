@@ -109,6 +109,82 @@ func installSupportsWatchPaths() -> Bool {
 }
 
 // ============================================================================
+// 高级选项
+// ============================================================================
+
+func readOptions() -> FirewallOptions {
+    guard let text = try? String(contentsOfFile: Paths.options, encoding: .utf8) else {
+        return FirewallOptions()
+    }
+    return FirewallOptions.parse(text)
+}
+
+/// 选项文件同样 admin 组可写、同样被 WatchPaths 监视，所以改开关也不用密码。
+func writeOptions(_ options: FirewallOptions) throws {
+    guard let handle = FileHandle(forWritingAtPath: Paths.options) else {
+        throw FirewallError.failed("无法写入选项文件")
+    }
+    defer { try? handle.close() }
+    do {
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data(options.serialized().utf8))
+    } catch {
+        throw FirewallError.failed("写入选项失败：\(error.localizedDescription)")
+    }
+}
+
+/// 写选项并等守护进程回报，和保存白名单是同一套机制。
+func saveOptionsAndWait(_ options: FirewallOptions,
+                        timeout: TimeInterval = 8) throws -> ApplyStatus? {
+    let before = applyStatusModified()
+    try writeOptions(options)
+    return waitForApply(after: before, timeout: timeout)
+}
+
+// ============================================================================
+// 开启前预检
+// ============================================================================
+
+/// 当前默认路由是不是走隧道。是的话，物理网卡上那条通往 VPN 节点的连接
+/// 必须在白名单里，否则一开防护隧道就会断 —— 这是最容易踩的坑。
+func defaultRouteGoesThroughTunnel() -> Bool {
+    guard let output = try? shellOutput("/sbin/route", ["-n", "get", "default"]) else {
+        return false
+    }
+    guard let line = output.components(separatedBy: "\n")
+        .first(where: { $0.contains("interface:") }) else { return false }
+    return line.contains("utun")
+}
+
+/// 白名单里有没有公网地址。一条都没有时开防护，等于只放行了隧道本身，
+/// 而建立隧道要走物理网卡 —— 结果就是连不上节点，整个网络断掉。
+func allowlistHasPublicEntry(_ text: String) -> Bool {
+    for rawLine in text.components(separatedBy: "\n") {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+        let address = line.components(separatedBy: "/")[0]
+        if !isPrivateIPv4(address) { return true }
+    }
+    return false
+}
+
+private func isPrivateIPv4(_ address: String) -> Bool {
+    let parts = address.split(separator: ".").compactMap { Int($0) }
+    guard parts.count == 4 else { return false }
+    switch (parts[0], parts[1]) {
+    case (10, _), (127, _), (255, 255): return true
+    case (192, 168): return true
+    case (172, 16...31): return true
+    case (169, 254): return true
+    default: return false
+    }
+}
+
+private func shellOutput(_ path: String, _ arguments: [String]) throws -> String {
+    try capture(path, arguments).1
+}
+
+// ============================================================================
 // 免密保存
 // ============================================================================
 
@@ -159,6 +235,11 @@ func saveAllowlistWithoutPassword(_ text: String, timeout: TimeInterval = 8) thr
     let before = applyStatusModified()
     try writeAllowlistDirectly(text)
 
+    return waitForApply(after: before, timeout: timeout)
+}
+
+/// 轮询 apply-status.txt 的 mtime，等守护进程处理完这次变更。
+private func waitForApply(after before: Date?, timeout: TimeInterval) -> ApplyStatus? {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         Thread.sleep(forTimeInterval: 0.1)
@@ -183,8 +264,8 @@ func saveAllowlist(_ listText: String, apply: Bool) throws {
     try runAdmin(saveScript(listText: listText, apply: apply))
 }
 
-func uninstallFirewall() throws {
-    try runAdmin(uninstallScript())
+func uninstallFirewall(keepConfig: Bool) throws {
+    try runAdmin(uninstallScript(keepConfig: keepConfig))
 }
 
 func disableProtection() throws {

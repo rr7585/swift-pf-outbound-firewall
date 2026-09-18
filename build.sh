@@ -9,7 +9,7 @@ BIN="PFOutboundFirewall"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-swiftc -O app/Rules.swift app/Core.swift app/App.swift -o "$APP/Contents/MacOS/$BIN"
+swiftc -O app/Rules.swift app/Core.swift app/ContentView.swift app/App.swift -o "$APP/Contents/MacOS/$BIN"
 
 # 图标：没有就现画一个（icon/make-icon.swift 是画法，改完重跑 icon/build-icon.sh）
 [ -f icon/AppIcon.icns ] || ./icon/build-icon.sh

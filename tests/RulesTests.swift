@@ -144,13 +144,27 @@ func testInstallScript() {
 }
 
 func testUninstallScript() {
-    let script = uninstallScript()
+    let script = uninstallScript(keepConfig: false)
     check(script.contains("launchctl bootout"), "停服务")
     check(script.contains("/sbin/pfctl -d"), "关闭 PF")
     check(script.contains("/bin/rm -rf '\(Paths.dataDir)'"), "删配置目录")
     check(script.contains("/bin/rm -f '\(Paths.daemonPlist)'"), "删 LaunchDaemon")
     // 半装状态也要能卸干净，所以每步都得容错。
     check(!script.contains("set -e"), "卸载不用 set -e")
+
+    // 保留配置时白名单不能被删 —— 那是用户一条条试出来的，删了代价很高。
+    let keep = uninstallScript(keepConfig: true)
+    check(!keep.contains("rm -rf '\(Paths.dataDir)'"), "保留模式不删整个目录")
+    check(!keep.contains("rm -f '\(Paths.allowlist)'"), "保留模式不删白名单")
+    check(keep.contains("launchctl bootout"), "保留模式同样停服务")
+    check(keep.contains("/sbin/pfctl -d"), "保留模式同样关闭 PF")
+    check(keep.contains("rm -f '\(Paths.daemonPlist)'"), "保留模式同样移除开机自启")
+    // 运行期文件要清掉，否则下次安装会带着上次的残留状态
+    for path in [Paths.rules, Paths.startup, Paths.installMarker, Paths.loadedRulesHash] {
+        check(keep.contains("rm -f '\(path)'"), "保留模式仍清理 \(path)")
+    }
+    // 彻底删除模式必须真的删干净
+    check(script.contains("rm -rf '\(Paths.dataDir)'"), "彻底模式删整个目录")
 }
 
 func testToggleScripts() {
@@ -193,7 +207,7 @@ func testDaemonFastPath() {
     let script = daemonScript()
     // 白名单变更走 -T replace：只换内核里那张表，不重载规则集、不清状态，
     // 现有连接一条都不会断。
-    check(script.contains("-T replace -f '\(Paths.allowlist)'"), "快路径用 -T replace 换表")
+    check(script.contains("-T replace -f '\(Paths.effectiveList)'"), "快路径用 -T replace 换表")
 
     // 走快路径的前提：pf 已启用、表已存在、内核里就是当前这份 rules.conf。
     check(script.contains("md5 -q"), "用校验和判断规则集有没有变")
@@ -236,6 +250,74 @@ func testDaemonScriptReportsEveryPath() {
     }
     check(disabledCheck.lowerBound < enable.lowerBound, "先判断关闭标记再谈启用")
     check(script.contains("/bin/sleep 0.3"), "等待写入落定，避开写到一半被触发")
+}
+
+// ============================================================================
+// 高级选项
+// ============================================================================
+func testFirewallOptions() {
+    // 默认全开
+    let d = FirewallOptions()
+    check(d.allowLAN && d.allowDHCP, "默认两项都开")
+    check(d.builtinEntries.contains("10.0.0.0/8"), "默认含私有网段")
+    check(d.builtinEntries.contains("255.255.255.255"), "默认含 DHCP 广播")
+
+    // 关掉之后对应条目要消失
+    var off = FirewallOptions(); off.allowLAN = false; off.allowDHCP = false
+    check(off.builtinEntries.isEmpty, "全关则没有内置条目")
+    var lanOnly = FirewallOptions(); lanOnly.allowDHCP = false
+    check(!lanOnly.builtinEntries.contains("255.255.255.255"), "关 DHCP 后不含广播地址")
+    check(lanOnly.builtinEntries.contains("192.168.0.0/16"), "关 DHCP 不影响局域网")
+
+    // 序列化往返
+    for original in [FirewallOptions(), off, lanOnly] {
+        let parsed = FirewallOptions.parse(original.serialized())
+        check(parsed == original, "序列化往返一致")
+    }
+
+    // 缺键、乱码时宁可多放行，也不要突然把用户局域网掐了
+    check(FirewallOptions.parse("") == FirewallOptions(), "空文件按默认（全开）")
+    check(FirewallOptions.parse("垃圾内容\n???") == FirewallOptions(), "无法解析按默认")
+    check(FirewallOptions.parse("lan=0").allowDHCP, "只写了 lan，dhcp 仍按默认开")
+    check(!FirewallOptions.parse("lan=0").allowLAN, "lan=0 生效")
+    check(FirewallOptions.parse("lan = 1").allowLAN, "容忍等号两边空格")
+
+    // 内置条目本身必须是合法地址，否则会让整条规则集加载失败
+    for entry in FirewallOptions().builtinEntries {
+        check(isValidAllowlistEntry(entry), "内置条目 \(entry) 合法")
+    }
+}
+
+func testDaemonComposesEffectiveList() {
+    let script = daemonScript()
+    // pf 读的是合成表，不是用户白名单
+    check(pfRules().contains("persist file \"\(Paths.effectiveList)\""), "规则表指向合成表")
+    check(script.contains("-T replace -f '\(Paths.effectiveList)'"), "快路径也用合成表")
+    // 合成 = 内置条目（按开关）+ 用户白名单
+    check(script.contains("opt lan"), "读局域网开关")
+    check(script.contains("opt dhcp"), "读 DHCP 开关")
+    check(script.contains("/bin/cat '\(Paths.allowlist)' >> "), "拼接用户白名单")
+    // 合成表由守护脚本生成，绝不能被 WatchPaths 监视，否则自触发死循环
+    check(daemonPlist().contains("<string>\(Paths.options)</string>"), "监视选项文件")
+    check(!daemonPlist().contains("<string>\(Paths.effectiveList)</string>"), "不监视合成表")
+    // 安装时建选项文件且组可写
+    let install = installScript()
+    check(install.contains("chown root:admin '\(Paths.options)'"), "选项文件归 admin 组")
+    check(install.contains("chmod 664 '\(Paths.options)'"), "选项文件组可写")
+    check(install.contains("test -f '\(Paths.options)' ||"), "已存在则不覆盖用户选择")
+}
+
+func testPreflightPublicEntryDetection() {
+    // 只有私有网段 → 开防护会断网，要拦
+    check(!allowlistHasPublicEntry(""), "空白名单没有公网地址")
+    check(!allowlistHasPublicEntry("10.0.0.0/8\n192.168.1.1\n172.16.0.0/12"), "全私有网段")
+    check(!allowlistHasPublicEntry("# 8.8.8.8\n"), "注释掉的不算")
+    check(!allowlistHasPublicEntry("127.0.0.1\n255.255.255.255\n169.254.1.1"), "回环/广播/链路本地都不算")
+    // 有公网地址 → 放行
+    check(allowlistHasPublicEntry("203.0.113.10"), "VPN 节点算公网")
+    check(allowlistHasPublicEntry("10.0.0.0/8\n8.8.8.8"), "混合里有公网")
+    check(allowlistHasPublicEntry("172.32.0.1"), "172.32 不在私有段内")
+    check(allowlistHasPublicEntry("2606:4700::/32"), "IPv6 算公网")
 }
 
 // ============================================================================
@@ -359,6 +441,9 @@ enum RulesTests {
         testDaemonScriptReportsEveryPath()
         testDaemonFastPath()
         testInstallResetsRulesHash()
+        testFirewallOptions()
+        testDaemonComposesEffectiveList()
+        testPreflightPublicEntryDetection()
         testAllowlistAccepts()
         testAllowlistRejects()
         testPrefixLengthBounds()

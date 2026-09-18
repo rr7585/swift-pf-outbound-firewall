@@ -4,5 +4,5 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 mkdir -p build
-swiftc -O app/Rules.swift tests/RulesTests.swift -o build/rules-tests
+swiftc -O app/Rules.swift app/Core.swift tests/RulesTests.swift -o build/rules-tests
 ./build/rules-tests
