@@ -29,6 +29,9 @@ final class Model: ObservableObject {
     /// 校验失败时要在编辑器里选中的范围，一次性。
     @Published var highlight: NSRange?
     @Published var showAdvanced = false
+    @Published var panel = Panel.allowlist
+    @Published var connections: [ConnectionRow] = []
+    private var refreshTimer: Timer?
     @Published var options = readOptions() {
         didSet {
             guard options != oldValue, installed, !applyingOptions else { return }
@@ -39,6 +42,23 @@ final class Model: ObservableObject {
     private var applyingOptions = false
     /// 开启防护前的预检提示；nil 表示没问题。
     @Published var preflight: AlertBox?
+
+    enum Panel: String, CaseIterable, Identifiable {
+        case allowlist, connections
+        var id: String { rawValue }
+        var title: String { self == .allowlist ? "白名单" : "连接" }
+    }
+
+    /// 一条连接加上它在当前规则下的归类结果。
+    struct ConnectionRow: Identifiable {
+        let connection: Connection
+        let count: Int
+        let verdict: ConnectionVerdict
+        var id: String {
+            "\(connection.processName)|\(connection.netProtocol)"
+                + "|\(connection.remoteAddress):\(connection.remotePort)"
+        }
+    }
 
     var statusTitle: String {
         if !installed { return "尚未安装" }
@@ -155,6 +175,62 @@ final class Model: ObservableObject {
     }
 
     // ------------------------------------------------------------------
+    // 连接面板
+    // ------------------------------------------------------------------
+
+    /// 采一次快照。lsof 要跑进程，别卡住主线程。
+    func refreshConnections() {
+        Task.detached(priority: .utility) {
+            let tunnels = tunnelAddresses()
+            let entries = effectiveEntries()
+            let rows = groupConnections(collectConnections())
+                .map { ConnectionRow(connection: $0.sample,
+                                     count: $0.count,
+                                     verdict: classify($0.sample, tunnelAddresses: tunnels,
+                                                       allowEntries: entries)) }
+                // 会被阻断的排最前 —— 那才是用户真正要看的
+                .sorted {
+                    let rank: (ConnectionVerdict) -> Int = {
+                        switch $0 {
+                        case .blocked: return 0
+                        case .allowlisted: return 1
+                        case .tunnel: return 2
+                        case .loopback: return 3
+                        }
+                    }
+                    if rank($0.verdict) != rank($1.verdict) {
+                        return rank($0.verdict) < rank($1.verdict)
+                    }
+                    return $0.connection.processName.localizedCompare(
+                        $1.connection.processName) == .orderedAscending
+                }
+            await MainActor.run { self.connections = rows }
+        }
+    }
+
+    /// 只在连接面板可见时才轮询，切走就停掉。
+    func setConnectionPolling(_ on: Bool) {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        guard on else { return }
+        refreshConnections()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+            Task { @MainActor in self.refreshConnections() }
+        }
+    }
+
+    /// 把某条连接的对端地址加进白名单并立即保存。
+    func allowAddress(_ address: String) {
+        guard !addressIsAllowlisted(address, entries: effectiveEntries()) else { return }
+        var text = listText
+        if !text.isEmpty && !text.hasSuffix("\n") { text += "\n" }
+        text += "\(address)\n"
+        listText = text
+        saveOrInstall()
+        refreshConnections()
+    }
+
+    // ------------------------------------------------------------------
     // 内部
     // ------------------------------------------------------------------
 
@@ -244,8 +320,21 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 18) {
                 Card { statusRow }
                 if model.installed {
-                    allowlistSection
-                    advancedSection
+                    Picker("", selection: $model.panel) {
+                        ForEach(Model.Panel.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 240)
+                    .frame(maxWidth: .infinity, alignment: .center)
+
+                    switch model.panel {
+                    case .allowlist:
+                        allowlistSection
+                        advancedSection
+                    case .connections:
+                        connectionsSection
+                    }
                 } else {
                     welcomeCard
                 }
@@ -329,6 +418,94 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.leading, 4)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 连接
+    // ------------------------------------------------------------------
+    private var connectionsSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("当前出站连接")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    model.refreshConnections()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("立即刷新")
+            }
+            .padding(.horizontal, 4)
+
+            Card(padding: 0) {
+                Table(model.connections) {
+                    TableColumn("应用") { row in
+                        HStack(spacing: 5) {
+                            Text(row.connection.processName).font(.callout).lineLimit(1)
+                            if row.count > 1 {
+                                Text("×\(row.count)")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    TableColumn("目标地址") { row in
+                        Text(row.connection.remoteDisplay)
+                            .font(.system(.callout, design: .monospaced))
+                    }
+                    .width(min: 170)
+                    TableColumn("协议") { row in
+                        Text(row.connection.netProtocol).font(.callout).foregroundStyle(.secondary)
+                    }
+                    .width(52)
+                    TableColumn("判定") { row in
+                        Label(row.verdict.label, systemImage: Self.symbol(for: row.verdict))
+                            .font(.callout)
+                            .foregroundStyle(Self.tint(for: row.verdict))
+                    }
+                    .width(110)
+                    TableColumn("") { row in
+                        if case .blocked = row.verdict {
+                            Button("放行") {
+                                model.allowAddress(row.connection.remoteAddress)
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                    .width(56)
+                }
+                .frame(minHeight: 200)
+            }
+
+            Text("按判定排序，会被阻断的排在最前。只能看到当前用户的进程 —— "
+                 + "系统守护进程需要管理员权限才可见。短连接可能在两次采样之间就结束了。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.leading, 4)
+        }
+        .onAppear { model.setConnectionPolling(true) }
+        .onDisappear { model.setConnectionPolling(false) }
+    }
+
+    private static func symbol(for verdict: ConnectionVerdict) -> String {
+        switch verdict {
+        case .tunnel: return "lock.shield.fill"
+        case .allowlisted: return "checkmark.circle.fill"
+        case .loopback: return "house.fill"
+        case .blocked: return "xmark.octagon.fill"
+        }
+    }
+
+    private static func tint(for verdict: ConnectionVerdict) -> Color {
+        switch verdict {
+        case .tunnel: return .green
+        case .allowlisted: return .blue
+        case .loopback: return .secondary
+        case .blocked: return .orange
         }
     }
 

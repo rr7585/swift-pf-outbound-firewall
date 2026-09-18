@@ -321,6 +321,138 @@ func testPreflightPublicEntryDetection() {
 }
 
 // ============================================================================
+// 连接采集
+// ============================================================================
+func testLsofParsing() {
+    // 真实 lsof -F pcnPT 的输出形态：p 开进程块，f 开文件块，P/n/T 属于当前文件
+    let sample = """
+    p462
+    crapportd
+    f10
+    PTCP
+    n*:61447
+    TST=LISTEN
+    f11
+    PTCP
+    n192.168.1.68:52000->203.0.113.10:443
+    TST=ESTABLISHED
+    p1234
+    cSafari
+    f5
+    PTCP
+    n[2001:db8::1]:51000->[2606:4700::1111]:443
+    TST=ESTABLISHED
+    f6
+    PUDP
+    n198.51.100.2:53888->8.8.8.8:53
+    """
+    let connections = parseLsofOutput(sample)
+    // 监听套接字没有对端，不该被当成连接
+    check(connections.count == 3, "解析出 3 条连接（实际 \(connections.count)）")
+    guard connections.count == 3 else { return }
+
+    checkEqual(connections[0].processName, "rapportd", "进程名跟着 p 块走")
+    check(connections[0].pid == 462, "pid 正确")
+    checkEqual(connections[0].remoteAddress, "203.0.113.10", "对端地址")
+    checkEqual(connections[0].remotePort, "443", "对端端口")
+    checkEqual(connections[0].localAddress, "192.168.1.68", "本地地址")
+    checkEqual(connections[0].localPort, "52000", "本地端口")
+
+    // IPv6 在 lsof 里带方括号，要剥掉
+    checkEqual(connections[1].processName, "Safari", "第二个进程块")
+    checkEqual(connections[1].remoteAddress, "2606:4700::1111", "IPv6 对端去掉方括号")
+    checkEqual(connections[1].localAddress, "2001:db8::1", "IPv6 本地去掉方括号")
+
+    checkEqual(connections[2].netProtocol, "UDP", "协议跟着 P 字段")
+    checkEqual(connections[2].remoteAddress, "8.8.8.8", "UDP 对端")
+
+    check(parseLsofOutput("").isEmpty, "空输入不崩")
+    check(parseLsofOutput("p1\ncFoo\nf1\nn*:80").isEmpty, "只有监听套接字则无连接")
+}
+
+func testSplitHostPort() {
+    check(splitHostPort("1.2.3.4:443")?.host == "1.2.3.4", "IPv4 主机")
+    check(splitHostPort("1.2.3.4:443")?.port == "443", "IPv4 端口")
+    check(splitHostPort("[::1]:8080")?.host == "::1", "IPv6 去方括号")
+    check(splitHostPort("[::1]:8080")?.port == "8080", "IPv6 端口")
+    check(splitHostPort("[fe80::1]")?.port == "", "IPv6 无端口")
+    check(splitHostPort("") == nil, "空串返回 nil")
+}
+
+func testAddressMatching() {
+    // 单个地址
+    check(addressMatches("8.8.8.8", entry: "8.8.8.8"), "精确匹配")
+    check(!addressMatches("8.8.8.9", entry: "8.8.8.8"), "不同地址不匹配")
+    // CIDR：按位比，边界要准
+    check(addressMatches("10.1.2.3", entry: "10.0.0.0/8"), "10/8 命中")
+    check(!addressMatches("11.1.2.3", entry: "10.0.0.0/8"), "11.x 不在 10/8")
+    check(addressMatches("172.16.0.1", entry: "172.16.0.0/12"), "172.16 命中 /12")
+    check(addressMatches("172.31.255.254", entry: "172.16.0.0/12"), "/12 上边界命中")
+    check(!addressMatches("172.32.0.1", entry: "172.16.0.0/12"), "172.32 超出 /12")
+    check(!addressMatches("172.15.0.1", entry: "172.16.0.0/12"), "172.15 低于 /12")
+    // 非 8 的倍数前缀，考验掩码位运算
+    check(addressMatches("192.168.1.5", entry: "192.168.1.0/29"), "/29 内")
+    check(!addressMatches("192.168.1.9", entry: "192.168.1.0/29"), "/29 外")
+    check(addressMatches("1.2.3.4", entry: "0.0.0.0/0"), "/0 匹配一切 IPv4")
+    // IPv6
+    check(addressMatches("2606:4700::1111", entry: "2606:4700::/32"), "IPv6 /32 命中")
+    check(!addressMatches("2607:4700::1111", entry: "2606:4700::/32"), "IPv6 前缀不同")
+    // 跨地址族不能互相命中
+    check(!addressMatches("8.8.8.8", entry: "2606:4700::/32"), "v4 不匹配 v6 条目")
+    check(!addressMatches("::1", entry: "0.0.0.0/0"), "v6 不匹配 v4 的 /0")
+    // 垃圾输入
+    check(!addressMatches("垃圾", entry: "8.8.8.8"), "非法地址不匹配")
+    check(!addressMatches("8.8.8.8", entry: "8.8.8.8/99"), "非法前缀不匹配")
+}
+
+func testConnectionGrouping() {
+    func make(_ name: String, _ remote: String, _ localPort: String) -> Connection {
+        Connection(processName: name, pid: 1, netProtocol: "UDP",
+                   localAddress: "198.51.100.2", localPort: localPort,
+                   remoteAddress: remote, remotePort: "443")
+    }
+    // 同进程同目标的多条 socket 合成一行，只是本地端口不同
+    let groups = groupConnections([
+        make("cloudd", "17.248.224.13", "1"),
+        make("cloudd", "17.248.224.13", "2"),
+        make("cloudd", "17.248.224.13", "3"),
+        make("Safari", "1.1.1.1", "4"),
+    ])
+    check(groups.count == 2, "合成 2 组（实际 \(groups.count)）")
+    guard groups.count == 2 else { return }
+    check(groups[0].count == 3, "cloudd 合成 3 条")
+    check(groups[1].count == 1, "Safari 单独一条")
+    check(groups[0].id != groups[1].id, "两组 id 不同")
+    // 本地端口不同的 socket，各自的 id 必须不同，否则列表会错乱
+    check(make("a", "1.1.1.1", "1").id != make("a", "1.1.1.1", "2").id, "本地端口计入 id")
+    check(groupConnections([]).isEmpty, "空输入不崩")
+}
+
+func testConnectionClassification() {
+    let tunnels: Set<String> = ["198.51.100.2"]
+    let entries = ["203.0.113.10", "10.0.0.0/8"]
+    func make(local: String, remote: String) -> Connection {
+        Connection(processName: "x", pid: 1, netProtocol: "TCP",
+                   localAddress: local, localPort: "5000",
+                   remoteAddress: remote, remotePort: "443")
+    }
+    // 本地地址是 utun 的地址 —— 直接证明这条连接从隧道出去
+    check(classify(make(local: "198.51.100.2", remote: "1.1.1.1"),
+                   tunnelAddresses: tunnels, allowEntries: entries).label == "走隧道", "隧道连接")
+    // 物理网卡出去，目标命中表
+    check(classify(make(local: "192.168.1.68", remote: "203.0.113.10"),
+                   tunnelAddresses: tunnels, allowEntries: entries).label == "白名单直连", "白名单直连")
+    // 物理网卡出去、不在表里 —— 开着防护就会被丢掉
+    check(classify(make(local: "192.168.1.68", remote: "1.1.1.1"),
+                   tunnelAddresses: tunnels, allowEntries: entries).label == "会被阻断", "会被阻断")
+    // 回环走 set skip，压根不过 pf
+    check(classify(make(local: "127.0.0.1", remote: "127.0.0.1"),
+                   tunnelAddresses: tunnels, allowEntries: entries).label == "本机", "回环")
+    check(classify(make(local: "::1", remote: "::1"),
+                   tunnelAddresses: tunnels, allowEntries: entries).label == "本机", "IPv6 回环")
+}
+
+// ============================================================================
 // 白名单校验
 // ============================================================================
 func testAllowlistAccepts() {
@@ -441,6 +573,11 @@ enum RulesTests {
         testDaemonScriptReportsEveryPath()
         testDaemonFastPath()
         testInstallResetsRulesHash()
+        testLsofParsing()
+        testSplitHostPort()
+        testAddressMatching()
+        testConnectionGrouping()
+        testConnectionClassification()
         testFirewallOptions()
         testDaemonComposesEffectiveList()
         testPreflightPublicEntryDetection()

@@ -67,6 +67,23 @@ enum Render {
                 m.installed = true; m.protected = true; m.listText = sample
                 m.busy = true; m.busyLabel = "正在保存 …"
             }
+            snapshot("7-连接面板", width: 640, height: 520, into: dir) { m in
+                m.installed = true; m.protected = true; m.listText = sample
+                m.panel = .connections
+                m.connections = [
+                    ("某个应用", "142.250.4.188:5228", "TCP", ConnectionVerdict.blocked),
+                    ("claude.exe", "160.79.104.10:443", "TCP", .tunnel),
+                    ("cloudd", "17.248.224.13:443", "UDP", .tunnel),
+                    ("WireGuard", "203.0.113.10:30102", "UDP", .allowlisted),
+                ].map { name, remote, proto, verdict in
+                    let parts = remote.components(separatedBy: ":")
+                    return Model.ConnectionRow(
+                        connection: Connection(processName: name, pid: 1, netProtocol: proto,
+                                               localAddress: "192.168.1.68", localPort: "5000",
+                                               remoteAddress: parts[0], remotePort: parts[1]),
+                        count: 1, verdict: verdict)
+                }
+            }
             snapshot("6-高级选项展开", width: 560, height: 620, into: dir) { m in
                 m.installed = true; m.protected = true; m.listText = sample
                 m.showAdvanced = true
