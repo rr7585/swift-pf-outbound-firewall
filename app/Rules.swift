@@ -55,8 +55,18 @@ func shellWrite(_ content: String, to path: String) -> String {
 /// 两种都匹配；兜底的 block 同理，所以 IPv6 也不会泄漏。
 func pfRules(allowlistPath: String) -> String {
     let lines = [
+        // 回环必须用 set skip 整个跳过 pf，不能写成 pass out quick on lo0。
+        //
+        // 回环包会被 pf 看到两次：lo0 出站一次、lo0 入站一次。用 pass 规则时，
+        // 出站 SYN 会带 flags S/SA keep state 建立状态；同一个 SYN 紧接着从 lo0
+        // 入站，pf 拿这条状态去匹配，发现反方向来的不是 SYN-ACK 而是个裸 SYN，
+        // 判定为序列异常直接丢掉 —— 表现就是本机 TCP 服务全连不上，
+        // 而 ICMP（ping 127.0.0.1）因为状态跟踪宽松反而是通的，很有迷惑性。
+        //
+        // set skip 让 pf 在 lo0 上完全不做检查也不建状态。回环流量出不了本机，
+        // 不存在泄漏问题，跳过是安全的。OpenBSD 自带的 pf.conf 也是这么写的。
+        "set skip on lo0",
         "table <vpn_allowlist> persist file \"\(allowlistPath)\"",
-        "pass out quick on lo0 all",
         "pass out quick on utun* all",
         "pass out quick to <vpn_allowlist>",
         "block drop out quick all",

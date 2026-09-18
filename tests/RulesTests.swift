@@ -54,7 +54,17 @@ func testShellQuote() {
 func testPFRules() {
     let rules = pfRules(allowlistPath: "/tmp/list.txt")
     check(rules.contains("table <vpn_allowlist> persist file \"/tmp/list.txt\""), "表指向给定路径")
-    check(rules.contains("pass out quick on lo0 all"), "放行 lo0")
+    // 回环必须 set skip 整个跳过，用 pass 规则会因为状态跟踪把本机 TCP 服务
+    // 全部打死（出站 SYN 建状态，同一个 SYN 从 lo0 入站时被判为序列异常丢弃）。
+    check(rules.contains("set skip on lo0"), "回环走 set skip")
+    check(!rules.contains("pass out quick on lo0"), "回环不能用 pass 规则")
+    // set 属于选项，必须排在过滤规则前面，否则 pfctl 直接语法错误。
+    guard let skipAt = rules.range(of: "set skip"),
+          let firstRule = rules.range(of: "pass out quick") else {
+        check(false, "规则缺少 set skip 或 pass 规则")
+        return
+    }
+    check(skipAt.lowerBound < firstRule.lowerBound, "set skip 排在过滤规则之前")
     // 通配而不是写死 utun0~9：VPN 落到 utun10+ 时不能断网。
     check(rules.contains("pass out quick on utun* all"), "用 utun* 通配放行虚拟网卡")
     check(!rules.contains("utun0 "), "不再写死具体 utun 编号")
