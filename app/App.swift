@@ -131,7 +131,8 @@ final class Model: ObservableObject {
         highlight = issue.range
         alert = AlertBox(
             title: "白名单第 \(issue.lineNumber) 行格式错误",
-            message: "“\(issue.text)” 不是有效的 IPv4 或 IPv4/CIDR。\n例如：8.8.8.8 或 192.168.1.0/24")
+            message: "“\(issue.text)” 不是有效的 IP 地址或网段。\n"
+                + "例如：8.8.8.8、192.168.1.0/24、2001:4860:4860::8888、2606:4700::/32")
         return false
     }
 
@@ -226,8 +227,8 @@ struct ContentView: View {
     private var installedView: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(model.legacyInstall
-                 ? "允许直连的目的 IP / CIDR（每行一个，# 开头为注释）"
-                 : "允许直连的目的 IP / CIDR（每行一个，# 开头为注释）· 保存无需密码")
+                 ? "允许直连的目的 IP / CIDR，IPv4 与 IPv6 均可（每行一个，# 开头为注释）"
+                 : "允许直连的目的 IP / CIDR，IPv4 与 IPv6 均可（每行一个，# 开头为注释）· 保存无需密码")
                 .font(.caption).foregroundStyle(.secondary)
 
             AllowlistEditor(text: $model.listText, highlight: $model.highlight)
@@ -244,7 +245,7 @@ struct ContentView: View {
 
     private var notInstalledView: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("安装后将默认阻断全部出站流量，只放行 lo0、utun0~9 和白名单地址。\n"
+            Text("安装后将默认阻断全部出站流量，只放行 lo0、utun 虚拟网卡和白名单地址。\n"
                 + "安装需要管理员密码。")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Spacer()

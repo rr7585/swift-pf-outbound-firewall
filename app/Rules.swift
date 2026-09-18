@@ -43,18 +43,24 @@ func shellWrite(_ content: String, to path: String) -> String {
 // PF 规则
 // ============================================================================
 
-/// 防护规则：放行 lo0、utun0~9 和白名单目的地址，其余出站一律丢弃。
+/// 防护规则：放行 lo0、所有 utun 虚拟网卡和白名单目的地址，其余出站一律丢弃。
 /// allowlistPath 指向 pf 自己去读的表文件，所以校验新白名单时可以先指到临时文件。
+///
+/// `utun*` 是 pf 的接口名通配，pfctl 不会在加载时把它展开成当时存在的那几个，
+/// 而是运行时按前缀匹配 —— 所以后来才出现的 utun10、utun11 一样放行。
+/// 早先写死 utun0~9 时，VPN 只要落到 utun10+（iCloud 私密代理、AirDrop
+/// 都会占号）就会直接断网。
+///
+/// 表里 IPv4 和 IPv6 可以混着放，`pass out quick to <表>` 不指定地址族时
+/// 两种都匹配；兜底的 block 同理，所以 IPv6 也不会泄漏。
 func pfRules(allowlistPath: String) -> String {
-    var lines = [
+    let lines = [
         "table <vpn_allowlist> persist file \"\(allowlistPath)\"",
         "pass out quick on lo0 all",
+        "pass out quick on utun* all",
+        "pass out quick to <vpn_allowlist>",
+        "block drop out quick all",
     ]
-    for index in 0...9 {
-        lines.append("pass out quick on utun\(index) all")
-    }
-    lines.append("pass out quick to <vpn_allowlist>")
-    lines.append("block drop out quick all")
     return lines.joined(separator: "\n") + "\n"
 }
 
@@ -256,25 +262,57 @@ struct AllowlistIssue {
     let range: NSRange
 }
 
+/// 判断地址属于哪个族，不是合法地址返回 nil。
+///
+/// 用系统的 inet_pton 而不是手搓正则：IPv6 的正则想写对太难（压缩零段、
+/// 内嵌 IPv4、各种边界），而最终要过的本来就是 pf 那一关，pf 用的就是这套解析。
+private func addressFamily(of text: String) -> Int32? {
+    var v4 = in_addr()
+    if text.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 { return AF_INET }
+    var v6 = in6_addr()
+    if text.withCString({ inet_pton(AF_INET6, $0, &v6) }) == 1 { return AF_INET6 }
+    return nil
+}
+
+/// IPv4 的某一段是否带前导零。
+///
+/// libc 和 pf 都按十进制读（`010` → `10`），所以不会真的解析错，但
+/// `ping`、部分解析器会按八进制读成 8 —— 同一份白名单换个工具含义就变了。
+/// 与其留这个坑，不如让用户写明确。
+private func hasLeadingZeroOctet(_ text: String) -> Bool {
+    text.split(separator: ".", omittingEmptySubsequences: false)
+        .contains { $0.count > 1 && $0.hasPrefix("0") }
+}
+
+/// 一条白名单记录是否合法：IPv4 或 IPv6 地址，可带 `/前缀长度`。
+///
+/// 比 pf 略严一点：pf 收前导零，这里不收，理由见上。
+/// 其余一律跟 pf 保持一致，包括 `fe80::1%en0` 这种带 scope 的写法。
+func isValidAllowlistEntry(_ text: String) -> Bool {
+    let parts = text.components(separatedBy: "/")
+    guard parts.count <= 2, let family = addressFamily(of: parts[0]) else { return false }
+    if family == AF_INET, hasLeadingZeroOctet(parts[0]) { return false }
+    guard parts.count == 2 else { return true }
+
+    let prefixText = parts[1]
+    guard !prefixText.isEmpty,
+          prefixText.allSatisfy({ $0.isASCII && $0.isNumber }),
+          let prefix = Int(prefixText) else { return false }
+    return prefix <= (family == AF_INET ? 32 : 128)
+}
+
 /// 逐行校验，返回第一处错误；全部合法返回 nil。
 /// 空行和 # 开头的注释行跳过 —— pf 的 table 文件本身就支持这两种。
 func validateAllowlist(_ text: String) -> AllowlistIssue? {
-    let octet = "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
-    let pattern = "^(?:\(octet)\\.){3}\(octet)(?:/(?:3[0-2]|[12]?[0-9]))?$"
-    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
-
     var offset = 0
     for (index, rawLine) in text.components(separatedBy: "\n").enumerated() {
         let rawLength = rawLine.utf16.count
         let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
-        if !trimmed.isEmpty && !trimmed.hasPrefix("#") {
-            let whole = NSRange(location: 0, length: trimmed.utf16.count)
-            if regex.firstMatch(in: trimmed, range: whole) == nil {
-                return AllowlistIssue(
-                    lineNumber: index + 1,
-                    text: trimmed,
-                    range: NSRange(location: offset, length: rawLength))
-            }
+        if !trimmed.isEmpty, !trimmed.hasPrefix("#"), !isValidAllowlistEntry(trimmed) {
+            return AllowlistIssue(
+                lineNumber: index + 1,
+                text: trimmed,
+                range: NSRange(location: offset, length: rawLength))
         }
         offset += rawLength + 1  // +1 是被 components 吃掉的那个换行
     }

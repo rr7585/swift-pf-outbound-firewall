@@ -55,10 +55,13 @@ func testPFRules() {
     let rules = pfRules(allowlistPath: "/tmp/list.txt")
     check(rules.contains("table <vpn_allowlist> persist file \"/tmp/list.txt\""), "表指向给定路径")
     check(rules.contains("pass out quick on lo0 all"), "放行 lo0")
-    for index in 0...9 {
-        check(rules.contains("pass out quick on utun\(index) all"), "放行 utun\(index)")
-    }
+    // 通配而不是写死 utun0~9：VPN 落到 utun10+ 时不能断网。
+    check(rules.contains("pass out quick on utun* all"), "用 utun* 通配放行虚拟网卡")
+    check(!rules.contains("utun0 "), "不再写死具体 utun 编号")
     check(rules.contains("pass out quick to <vpn_allowlist>"), "放行白名单")
+    // 规则不指定地址族，IPv4/IPv6 都走同一套。
+    check(!rules.contains("inet6"), "不按地址族分叉")
+    check(!rules.contains("inet "), "不按地址族分叉")
 
     // 兜底的 block 必须是最后一条：pf 的 quick 先匹配先生效，
     // 它要是跑到前面去，整条规则集就等于全断网。
@@ -206,6 +209,20 @@ func testAllowlistAccepts() {
         "# 注释",
         "  # 缩进的注释",
         "8.8.8.8\n# 节点\n203.0.113.10\n192.168.0.0/16\n",
+        // IPv6
+        "2001:4860:4860::8888",
+        "2606:4700::/32",
+        "::1",
+        "::",
+        "fe80::1",
+        "2001:db8:85a3:0:0:8a2e:370:7334",
+        "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+        "::ffff:192.168.1.1",              // IPv4 映射地址
+        "2001:db8::/128",
+        "2001:db8::/0",
+        "  2001:db8::1  ",
+        "fe80::1%en0",                     // 带 scope 的链路本地地址，pf 也收
+        "8.8.8.8\n2001:4860:4860::8888\n# 混排\n10.0.0.0/8\n2606:4700::/32\n",
     ]
     for text in valid {
         check(validateAllowlist(text) == nil, "应接受: \(text.debugDescription)")
@@ -215,19 +232,42 @@ func testAllowlistAccepts() {
 func testAllowlistRejects() {
     let invalid = [
         "256.1.1.1",          // 超出 255
-        "1.2.3",              // 段数不足
+        // pf 走 inet_aton 会把这些当简写收下（1.2.3 → 1.2.0.3），含义与直觉相反，
+        // 我们走 inet_pton 一律拒绝。见 tests/cross-check-pf.sh
+        "1.2.3",
+        "1.2",
+        "16909060",
         "1.2.3.4.5",          // 段数过多
         "1.2.3.4/33",         // 掩码越界
         "1.2.3.4/",           // 掩码缺失
         "example.com",        // 不支持域名
-        "2001:db8::1",        // 不支持 IPv6
         "1.2.3.4 5.6.7.8",    // 一行只能一条
-        "01.2.3.4",           // 前导零
+        // IPv6 的错法
+        "2001:db8::1/129",    // 前缀越界
+        "2001:xyz::1",        // 非法字符
+        "2001:db8:::1",       // 三个冒号
+        "2001:db8::1::2",     // 两处压缩
+        "2001:db8::1/",       // 前缀缺失
+        "2001:db8::1/-1",
+        "12345::1",           // 段超过 4 位
+        "01.2.3.4",           // 前导零：pf 收，但换个工具可能按八进制读
+        "010.1.1.1",
+        "1.2.3.04",
         "-1.2.3.4",
     ]
     for text in invalid {
         check(validateAllowlist(text) != nil, "应拒绝: \(text.debugDescription)")
     }
+}
+
+func testPrefixLengthBounds() {
+    // v4 上限 32、v6 上限 128，别用同一个数
+    check(isValidAllowlistEntry("1.2.3.4/32"), "v4 /32 合法")
+    check(!isValidAllowlistEntry("1.2.3.4/33"), "v4 /33 越界")
+    check(!isValidAllowlistEntry("1.2.3.4/128"), "v4 不能用 v6 的上限")
+    check(isValidAllowlistEntry("2001:db8::/128"), "v6 /128 合法")
+    check(!isValidAllowlistEntry("2001:db8::/129"), "v6 /129 越界")
+    check(isValidAllowlistEntry("2001:db8::/33"), "v6 /33 合法")
 }
 
 func testAllowlistIssueLocation() {
@@ -273,6 +313,7 @@ enum RulesTests {
         testDaemonScriptReportsEveryPath()
         testAllowlistAccepts()
         testAllowlistRejects()
+        testPrefixLengthBounds()
         testAllowlistIssueLocation()
         testAllowlistRangeWithCJK()
 
