@@ -109,6 +109,7 @@ fe80::1%en0
 | `/Library/Application Support/PFOutboundFirewall/startup.sh` | 守护脚本（开机 + 白名单变更共用） |
 | `/Library/Application Support/PFOutboundFirewall/startup.log` | 守护脚本日志 |
 | `/Library/Application Support/PFOutboundFirewall/apply-status.txt` | 守护脚本每次处理完的结果，GUI 读它做反馈 |
+| `/Library/Application Support/PFOutboundFirewall/rules.loaded` | 上次加载进内核的规则集校验和，用来判断走快路径还是全量重载 |
 | `/Library/LaunchDaemons/com.user.pf-outbound.plist` | LaunchDaemon（`RunAtLoad` + `WatchPaths`） |
 | `/var/run/com.user.pf-outbound.disabled` | 关闭标记，重启后自动清空并恢复防护 |
 
@@ -126,6 +127,17 @@ AppleScript 字面量，所以只剩 shell 一层引用要管，由 `shellQuote`
 脚本碰一下就会把自己再次触发，无限循环烧 CPU。测试里锁了这条
 （`testDaemonScriptNeverWritesAllowlist`）。同理，脚本的每条退出路径都必须写
 `apply-status.txt`，否则 GUI 只能一直等到超时。
+
+**改白名单走 `pfctl -T replace`，不要重载整个规则集**。守护脚本会先判断这次触发
+是不是「只有白名单变了」—— pf 已启用、表已存在、且内核里加载的就是当前这份
+`rules.conf`（比对校验和）。三个条件都满足就只换内核里那张表的内容，
+不重载规则集也不清状态，**现有连接一条都不会断**。
+
+实测：一个限速下载跑到一半时新增白名单条目，下载未中断，正常跑完。
+
+只有条目被**移除**时才额外 `pfctl -F states` —— 光换表不够，已经建立的连接
+靠旧状态还能继续跑，必须清状态才能真正切断，而这正是用户删条目时想要的效果。
+前后两份表都取自 `pfctl -T show`，规范化方式一致，不会因为写法差异误判。
 
 **`ThrottleInterval` 要调小**。launchd 默认同一个 job 两次启动至少隔 10 秒，
 不改的话连着存两次白名单，第二次要等十秒才生效。设成 1。

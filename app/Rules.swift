@@ -17,6 +17,9 @@ enum Paths {
     static let startupLog = dataDir + "/startup.log"
     /// 守护进程每次处理完写在这里，GUI 靠它知道免密保存到底生效没有。
     static let applyStatus = dataDir + "/apply-status.txt"
+    /// 上次成功加载进内核的那份 rules.conf 的校验和。
+    /// 用来判断这次触发只是白名单变了（快路径），还是规则集本身变了（全量重载）。
+    static let loadedRulesHash = dataDir + "/rules.loaded"
     // /var/run 重启后清空；开机任务会重新开启 PF，所以“已关闭”不应跨重启保留。
     static let disabledMarker = "/var/run/com.user.pf-outbound.disabled"
     static let daemonPlist = "/Library/LaunchDaemons/com.user.pf-outbound.plist"
@@ -144,6 +147,11 @@ func saveScript(listText: String, apply: Bool) -> String {
 func daemonScript() -> String {
     let statusPath = shellQuote(Paths.applyStatus)
     let statusTempPath = shellQuote(Paths.applyStatus + ".new")
+    let rulesPath = shellQuote(Paths.rules)
+    let listPath = shellQuote(Paths.allowlist)
+    let hashPath = shellQuote(Paths.loadedRulesHash)
+    let beforePath = shellQuote(Paths.dataDir + "/table.before")
+    let afterPath = shellQuote(Paths.dataDir + "/table.after")
     let loadRules = pfLoadCommand(onFailure: "report fail \"加载 PF 规则失败\"; exit 1")
     return """
     #!/bin/sh
@@ -163,7 +171,7 @@ func daemonScript() -> String {
 
     # 先干跑校验。不通过就原样退出 —— 内核里还是上一份规则，
     # 也就是说白名单写错了只会“没生效”，不会把网络锁死。
-    if ! /sbin/pfctl -nf \(shellQuote(Paths.rules)); then
+    if ! /sbin/pfctl -nf \(rulesPath); then
         report fail "白名单语法有误，已保持原有规则"
         exit 1
     fi
@@ -174,11 +182,52 @@ func daemonScript() -> String {
         exit 0
     fi
 
+    # 走不走快路径：pf 已启用、表已存在、且内核里加载的就是当前这份 rules.conf。
+    # 三个条件都满足，说明这次触发只可能是白名单变了，不必重载整个规则集。
+    rules_hash=$(/sbin/md5 -q \(rulesPath) 2>/dev/null)
+    fast=0
+    if /sbin/pfctl -s info 2>/dev/null | /usr/bin/grep -q '^Status: Enabled' \\
+       && /sbin/pfctl -t vpn_allowlist -T show >/dev/null 2>&1 \\
+       && [ -n "$rules_hash" ] \\
+       && [ "$rules_hash" = "$(/bin/cat \(hashPath) 2>/dev/null)" ]; then
+        fast=1
+    fi
+
+    if [ "$fast" = 1 ]; then
+        # 快路径：只把内核里那张表的内容换掉。
+        # 不碰规则集、不清状态，所以现有连接一条都不会断。
+        /sbin/pfctl -t vpn_allowlist -T show 2>/dev/null \\
+            | /usr/bin/sed 's/^[[:space:]]*//' | /usr/bin/sort > \(beforePath)
+        if ! /sbin/pfctl -t vpn_allowlist -T replace -f \(listPath); then
+            report fail "更新白名单失败"
+            exit 1
+        fi
+        /sbin/pfctl -t vpn_allowlist -T show 2>/dev/null \\
+            | /usr/bin/sed 's/^[[:space:]]*//' | /usr/bin/sort > \(afterPath)
+
+        # 前后都取自 pfctl 自己的输出，规范化方式一致，不会因为写法差异误判。
+        removed=$(/usr/bin/comm -23 \(beforePath) \(afterPath))
+        /bin/rm -f \(beforePath) \(afterPath)
+        /usr/bin/touch \(shellQuote(Paths.installMarker))
+
+        if [ -n "$removed" ]; then
+            # 有条目被删掉。光换表不够 —— 已经建立的连接靠旧状态还能继续跑，
+            # 必须清状态才能真正切断，这正是用户删条目时想要的效果。
+            /sbin/pfctl -F states
+            report ok "白名单已更新，移除的地址已断开"
+        else
+            report ok "白名单已更新，现有连接未受影响"
+        fi
+        exit 0
+    fi
+
+    # 全量路径：开机，或者规则集本身变了（装新版、改了规则模板）。
     \(loadRules)
     if ! /sbin/pfctl -s info 2>/dev/null | /usr/bin/grep -q '^Status: Enabled'; then
         /sbin/pfctl -e
     fi
     /sbin/pfctl -F states
+    /usr/bin/printf '%s' "$rules_hash" > \(hashPath)
     /usr/bin/touch \(shellQuote(Paths.installMarker))
     report ok "已生效"
 
@@ -211,6 +260,8 @@ func installScript() -> String {
         "/bin/mkdir -p \(shellQuote(Paths.dataDir))",
         "/bin/chmod 755 \(shellQuote(Paths.dataDir))",
         "/bin/rm -f \(shellQuote(Paths.installMarker))",
+        // 清掉旧哈希，保证装完第一次跑守护脚本走全量加载而不是快路径
+        "/bin/rm -f \(shellQuote(Paths.loadedRulesHash))",
         "/usr/bin/touch \(shellQuote(Paths.allowlist))",
         shellWrite(pfRules(allowlistPath: Paths.allowlist), to: Paths.rules),
         // 白名单交给 admin 组可写，GUI 就能免密改它，由 WatchPaths 触发重载。

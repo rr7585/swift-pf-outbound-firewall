@@ -189,6 +189,37 @@ func testDaemonScriptNeverWritesAllowlist() {
     check(script.contains(shellQuote(Paths.rules)), "守护脚本加载的是 rules.conf")
 }
 
+func testDaemonFastPath() {
+    let script = daemonScript()
+    // 白名单变更走 -T replace：只换内核里那张表，不重载规则集、不清状态，
+    // 现有连接一条都不会断。
+    check(script.contains("-T replace -f '\(Paths.allowlist)'"), "快路径用 -T replace 换表")
+
+    // 走快路径的前提：pf 已启用、表已存在、内核里就是当前这份 rules.conf。
+    check(script.contains("md5 -q"), "用校验和判断规则集有没有变")
+    check(script.contains("'\(Paths.loadedRulesHash)'"), "比对上次加载的校验和")
+    check(script.contains("-T show"), "取表内容做前后对比")
+
+    // 删条目时光换表不够，已建立的连接靠旧状态还能跑，必须清状态。
+    guard let removedCheck = script.range(of: "if [ -n \"$removed\" ]"),
+          let flush = script.range(of: "/sbin/pfctl -F states", range: removedCheck.upperBound..<script.endIndex) else {
+        check(false, "删条目后缺少清状态")
+        return
+    }
+    check(flush.lowerBound > removedCheck.lowerBound, "仅在有条目被移除时清状态")
+
+    // 全量路径跑完要记下校验和，否则下次永远走不了快路径。
+    check(script.contains("> '\(Paths.loadedRulesHash)'"), "全量加载后记录校验和")
+    // 两条路径都要落 installed.ok，安装脚本靠它判断装好没有。
+    let markerCount = script.components(separatedBy: "touch '\(Paths.installMarker)'").count - 1
+    check(markerCount == 2, "快慢两条路径都写 installed.ok（实际 \(markerCount) 处）")
+}
+
+func testInstallResetsRulesHash() {
+    // 装完第一次必须走全量加载，不能因为哈希碰巧相同就跳过。
+    check(installScript().contains("/bin/rm -f '\(Paths.loadedRulesHash)'"), "安装时清掉旧校验和")
+}
+
 func testDaemonScriptReportsEveryPath() {
     let script = daemonScript()
     // 每条退出路径都要写状态，否则 GUI 只能干等到超时。
@@ -326,6 +357,8 @@ enum RulesTests {
         testDaemonPlist()
         testDaemonScriptNeverWritesAllowlist()
         testDaemonScriptReportsEveryPath()
+        testDaemonFastPath()
+        testInstallResetsRulesHash()
         testAllowlistAccepts()
         testAllowlistRejects()
         testPrefixLengthBounds()
