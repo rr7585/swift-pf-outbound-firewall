@@ -29,6 +29,15 @@ VPN 断线或分流失效时，流量不会 fallback 到物理网卡，真实 IP
 要求 macOS 13+。产物会做 ad-hoc 签名（Apple Silicon 上不签名的 .app
 拷到别的机器会报「已损坏」）。
 
+图标是代码画的，改了 `icon/make-icon.swift` 之后跑：
+
+```bash
+./icon/build-icon.sh   # 重新生成 icon/AppIcon.icns
+./build.sh
+```
+
+`build.sh` 只在 `AppIcon.icns` 不存在时才自动调它，所以平时编译不会多花时间。
+
 ## 目录结构
 
 | 路径 | 说明 |
@@ -38,6 +47,8 @@ VPN 断线或分流失效时，流量不会 fallback 到物理网卡，真实 IP
 | `app/App.swift` | SwiftUI 界面 |
 | `tests/RulesTests.swift` | `Rules.swift` 的测试，不依赖 XCTest / Xcode |
 | `tests/cross-check-pf.sh` | 拿真 `pfctl` 核对白名单校验器的判断，手动跑 |
+| `icon/make-icon.swift` | 图标画法（纯 CoreGraphics，不依赖设计工具） |
+| `icon/build-icon.sh` | 生成 `icon/AppIcon.icns` |
 | `legacy/PFOutboundFirewall.applescript` | AppleScriptObjC 原版，行为参照 |
 | `legacy/pf-rules-standalone.sh` | 纯 shell 版，白名单写死在脚本里，`sudo` 跑一次当次生效 |
 
@@ -162,6 +173,9 @@ AppleScript 字面量，所以只剩 shell 一层引用要管，由 `shellQuote`
 
 **关闭标记放 `/var/run`**。重启后自动清空，开机任务重新开启防护 ——
 kill-switch 不应该因为你昨天临时关过就一直关着。
+
+**图标要留白**。Big Sur 之后的 App 图标不铺满画布：1024 的画布里圆角方块只占 824，
+四周留白。铺满的话图标在 Dock 里会比旁边的大一圈，非常显眼。
 
 **窗口尺寸别用 `.windowResizability(.contentMinSize)`**。它把窗口最小尺寸钉在
 内容最小尺寸上，而 `AllowlistEditor` 包着的 NSScrollView 会报一个很大的固有尺寸，
