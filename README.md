@@ -6,7 +6,7 @@ Swift 重写版，前身是 `legacy/PFOutboundFirewall.applescript`。
 防护开启后默认阻断所有出站流量，只放行：
 
 - 本机回环 `lo0`（用 `set skip` 完全跳过 pf）
-- 所有 `utun*` 虚拟网卡（VPN / 代理加密后的流量）
+- `utun0` ~ `utun31` 虚拟网卡（VPN / 代理加密后的流量）
 - 白名单里的目的 IP / CIDR，**IPv4 与 IPv6 均可**（VPN 节点、局域网、必需的直连地址）
 
 VPN 断线或分流失效时，流量不会 fallback 到物理网卡，真实 IP 不泄漏。
@@ -151,10 +151,24 @@ AppleScript 字面量，所以只剩 shell 一层引用要管，由 `shellQuote`
 `set skip` 让 pf 在 lo0 上完全不做检查也不建状态。回环流量出不了本机，
 不存在泄漏问题，跳过是安全的；OpenBSD 自带的 pf.conf 就是这么写的。
 
-**接口名用 `utun*` 通配，不要写死编号**。pfctl 不会在加载时把它展开成当时
-存在的那几个，而是运行时按前缀匹配 —— 所以后来才出现的 utun10、utun11 一样放行。
-早先写死 `utun0`~`utun9`，VPN 只要落到 utun10+（iCloud 私密代理、AirDrop 都会占号）
-就会直接断网。
+**接口名必须枚举，`utun*` 通配在 macOS 上没用**。`pfctl` 收这个语法、
+`pfctl -nvf` 也会把它原样打印出来，看上去完全正常，但运行时**一个包都匹配不上**。
+
+只看解析结果会被骗过去，要看规则命中计数（`pfctl -vsr`）才能发现。实测同一份
+规则集里两条并排放：
+
+```
+pass out quick on utun* all   [ Evaluations: 1921  Packets: 0    ]
+pass out quick on utun4 all   [ Evaluations: 1921  Packets: 1422 ]
+```
+
+接口组写法（`on utun`）同理 —— 语法收，运行时不匹配，macOS 的 `ifconfig`
+本来也没有 groups 这个概念。
+
+所以只能枚举到 `maxUtunIndex`（当前 31）。有上限意味着编号更大的 utun 不被放行，
+但这个失败方向是安全的：表现为「VPN 连不上」而不是「真实 IP 泄漏」。
+32 个对实际使用绰绰有余 —— macOS 分配 utun 时取最小空闲编号，
+要突破得同时存在 32 条隧道。
 
 **IPv4 和 IPv6 共用一张表**。pf 的 table 可以混放两种地址，
 `pass out quick to <表>` 不指定地址族时两种都匹配，兜底的 block 同理。
@@ -218,7 +232,7 @@ sudo launchctl bootout system/com.user.pf-outbound   # 停掉开机自启
 
 - **改白名单不再需要密码**（原版每次保存都弹授权框）
 - **白名单支持 IPv6**（原版只认 IPv4）
-- **接口用 `utun*` 通配**（原版写死 utun0~9，VPN 落到 utun10+ 就断网）
+- **utun 枚举到 31**（原版只到 utun9，VPN 落到 utun10+ 就断网）
 - 启用防护从两次提权合成一次（原版 `saveAllowlist` + `enable` 各弹一次密码）
 - 原版手搓了一整套 `configureMainMenu` 才让 ⌘C/⌘V 能用，SwiftUI 自带标准编辑菜单，全删了
 - 原版为了能在脚本编辑器里调试，带了一整条 `editorHostMode` 模态分支，不再需要
@@ -226,7 +240,7 @@ sudo launchctl bootout system/com.user.pf-outbound   # 停掉开机自启
 
 ## 已知取舍
 
-- **`utun*` 放行的是所有隧道**，不只是你的 VPN。iCloud 私密代理之类的隧道
+- **放行的是所有 utun 隧道**，不只是你的 VPN。iCloud 私密代理之类的隧道
   起来了也会被放行。对 kill-switch 来说这是有意的 —— 目的是「不许绕过隧道
   直连」，而不是「只许用某一条隧道」
 - **白名单不支持域名**，理由见上面的表

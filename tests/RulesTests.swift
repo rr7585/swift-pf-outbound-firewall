@@ -65,9 +65,14 @@ func testPFRules() {
         return
     }
     check(skipAt.lowerBound < firstRule.lowerBound, "set skip 排在过滤规则之前")
-    // 通配而不是写死 utun0~9：VPN 落到 utun10+ 时不能断网。
-    check(rules.contains("pass out quick on utun* all"), "用 utun* 通配放行虚拟网卡")
-    check(!rules.contains("utun0 "), "不再写死具体 utun 编号")
+    // 必须枚举，不能用通配：macOS 的 pf 收 utun* 的语法但运行时一个包都不匹配
+    // （实测 on utun* 评估 1921 次命中 0 包，同期 on utun4 命中 1422 包）。
+    check(!rules.contains("utun*"), "绝不能用 utun* 通配")
+    check(!rules.contains("on utun all"), "也不能用接口组写法")
+    for index in 0...maxUtunIndex {
+        check(rules.contains("utun\(index)"), "放行 utun\(index)")
+    }
+    check(!rules.contains("utun\(maxUtunIndex + 1)"), "上限之外不放行")
     check(rules.contains("pass out quick to <vpn_allowlist>"), "放行白名单")
     // 规则不指定地址族，IPv4/IPv6 都走同一套。
     check(!rules.contains("inet6"), "不按地址族分叉")

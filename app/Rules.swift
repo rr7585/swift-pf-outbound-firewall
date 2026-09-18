@@ -43,17 +43,26 @@ func shellWrite(_ content: String, to path: String) -> String {
 // PF 规则
 // ============================================================================
 
-/// 防护规则：放行 lo0、所有 utun 虚拟网卡和白名单目的地址，其余出站一律丢弃。
-/// allowlistPath 指向 pf 自己去读的表文件，所以校验新白名单时可以先指到临时文件。
+/// 虚拟网卡放行到 utunN 为止。
 ///
-/// `utun*` 是 pf 的接口名通配，pfctl 不会在加载时把它展开成当时存在的那几个，
-/// 而是运行时按前缀匹配 —— 所以后来才出现的 utun10、utun11 一样放行。
-/// 早先写死 utun0~9 时，VPN 只要落到 utun10+（iCloud 私密代理、AirDrop
-/// 都会占号）就会直接断网。
+/// 本来想用 `utun*` 通配一劳永逸，实测行不通：macOS 的 pf 能解析这个写法、
+/// 也会原样保留在规则集里，但运行时一个包都匹配不上。用规则命中计数验过 ——
+/// `on utun*` 评估 1921 次命中 0 个包，同一时刻 `on utun4` 命中 1422 个包。
+/// 接口组（`on utun`）同理，语法收但运行时不匹配，macOS 的 ifconfig 也没有
+/// groups 这个概念。所以只能老老实实枚举。
+///
+/// 枚举有上限就意味着编号更大的 utun 不被放行。这个方向是安全的 ——
+/// 失败表现为「VPN 连不上」而不是「真实 IP 泄漏」。32 个对实际使用足够：
+/// iCloud 私密代理、AirDrop 加几条 VPN 也到不了这个数。
+let maxUtunIndex = 31
+
+/// 防护规则：放行 lo0、utun 虚拟网卡和白名单目的地址，其余出站一律丢弃。
+/// allowlistPath 指向 pf 自己去读的表文件，所以校验新白名单时可以先指到临时文件。
 ///
 /// 表里 IPv4 和 IPv6 可以混着放，`pass out quick to <表>` 不指定地址族时
 /// 两种都匹配；兜底的 block 同理，所以 IPv6 也不会泄漏。
 func pfRules(allowlistPath: String) -> String {
+    let utuns = (0...maxUtunIndex).map { "utun\($0)" }.joined(separator: " ")
     let lines = [
         // 回环必须用 set skip 整个跳过 pf，不能写成 pass out quick on lo0。
         //
@@ -67,7 +76,8 @@ func pfRules(allowlistPath: String) -> String {
         // 不存在泄漏问题，跳过是安全的。OpenBSD 自带的 pf.conf 也是这么写的。
         "set skip on lo0",
         "table <vpn_allowlist> persist file \"\(allowlistPath)\"",
-        "pass out quick on utun* all",
+        // 花括号由 pfctl 展开成一条条独立规则，和手写 32 行等价，只是源文件短些。
+        "pass out quick on { \(utuns) } all",
         "pass out quick to <vpn_allowlist>",
         "block drop out quick all",
     ]
