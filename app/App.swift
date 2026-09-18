@@ -46,6 +46,10 @@ final class Model: ObservableObject {
     @Published var busyLabel = ""
     @Published var alert: AlertBox?
     @Published var askUninstall = false
+    /// 上一次操作的结果，显示在状态行旁边（守护进程回报的那句话）。
+    @Published var note = ""
+    /// 旧版安装：LaunchDaemon 没有 WatchPaths，保存白名单还得输密码。
+    @Published var legacyInstall = isInstalled() && !installSupportsWatchPaths()
     /// 校验失败时要在编辑器里选中的范围，一次性。
     @Published var highlight: NSRange?
 
@@ -68,27 +72,53 @@ final class Model: ObservableObject {
         let text = listText
         let wasInstalled = installed
         let shouldApply = protected
-        run(wasInstalled ? "正在保存并加载规则 …" : "正在安装 …", reloadList: true) {
-            if wasInstalled {
-                try saveAllowlist(text, apply: shouldApply)
-            } else {
+        run(wasInstalled ? "正在保存 …" : "正在安装 …", reloadList: true) {
+            guard wasInstalled else {
                 try installAndEnable()
+                return "已安装并启用"
             }
+            guard installSupportsWatchPaths() else {
+                try saveAllowlist(text, apply: shouldApply)
+                return "已保存"
+            }
+            // 免密：只写文件，重载由 WatchPaths 触发的守护进程完成。
+            guard let status = try saveAllowlistWithoutPassword(text) else {
+                return "已保存，但等守护进程确认超时"
+            }
+            if !status.ok { throw FirewallError.failed(status.detail) }
+            return status.detail
         }
     }
 
     func toggleProtection() {
         if protected {
-            run("正在关闭防护 …", reloadList: false) { try disableProtection() }
+            run("正在关闭防护 …", reloadList: false) {
+                try disableProtection()
+                return "防护已关闭"
+            }
             return
         }
         guard checkAllowlist() else { return }
         let text = listText
-        run("正在启用防护 …", reloadList: false) { try enableProtection(listText: text) }
+        run("正在启用防护 …", reloadList: false) {
+            try enableProtection(listText: text)
+            return "防护已开启"
+        }
     }
 
     func uninstall() {
-        run("正在卸载 …", reloadList: true) { try uninstallFirewall() }
+        run("正在卸载 …", reloadList: true) {
+            try uninstallFirewall()
+            return nil
+        }
+    }
+
+    /// 旧版安装升级成带 WatchPaths 的新版。安装脚本本身是幂等的，重跑即可。
+    func reinstall() {
+        run("正在升级安装 …", reloadList: true) {
+            try installAndEnable()
+            return "已升级，之后改白名单不再需要密码"
+        }
     }
 
     // ------------------------------------------------------------------
@@ -109,28 +139,33 @@ final class Model: ObservableObject {
     /// 失败时一律不覆盖，否则用户刚敲的白名单就没了。
     private func run(_ label: String,
                      reloadList: Bool,
-                     _ work: @escaping @Sendable () throws -> Void) {
+                     _ work: @escaping @Sendable () throws -> String?) {
         guard !busy else { return }
         busy = true
         busyLabel = label
+        note = ""
         Task.detached(priority: .userInitiated) {
             var failure: String?
+            var outcome: String?
             do {
-                try work()
+                outcome = try work()
             } catch FirewallError.cancelled {
                 // 用户自己点的取消，不报错
             } catch {
                 failure = String(describing: error)
             }
             let message = failure
+            let result = outcome
             await MainActor.run {
                 self.busy = false
                 self.installed = isInstalled()
                 self.protected = isProtected()
+                self.legacyInstall = self.installed && !installSupportsWatchPaths()
                 if let message {
                     self.alert = AlertBox(title: "操作失败", message: message)
-                } else if reloadList {
-                    self.listText = readAllowlist()
+                } else {
+                    self.note = result ?? ""
+                    if reloadList { self.listText = readAllowlist() }
                 }
             }
         }
@@ -151,8 +186,20 @@ struct ContentView: View {
                 if model.busy {
                     ProgressView().controlSize(.small).padding(.leading, 4)
                     Text(model.busyLabel).font(.caption).foregroundStyle(.secondary)
+                } else if !model.note.isEmpty {
+                    Text("· " + model.note).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+            }
+
+            if model.legacyInstall {
+                HStack(spacing: 8) {
+                    Text("旧版安装：改白名单仍需密码")
+                        .font(.caption).foregroundStyle(.orange)
+                    Button("升级") { model.reinstall() }
+                        .controlSize(.small)
+                    Spacer()
+                }
             }
 
             if model.installed {
@@ -178,7 +225,9 @@ struct ContentView: View {
 
     private var installedView: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("允许直连的目的 IP / CIDR（每行一个，# 开头为注释）")
+            Text(model.legacyInstall
+                 ? "允许直连的目的 IP / CIDR（每行一个，# 开头为注释）"
+                 : "允许直连的目的 IP / CIDR（每行一个，# 开头为注释）· 保存无需密码")
                 .font(.caption).foregroundStyle(.secondary)
 
             AllowlistEditor(text: $model.listText, highlight: $model.highlight)

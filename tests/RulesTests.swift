@@ -107,14 +107,20 @@ func testInstallScript() {
     check(script.contains("bootout") && script.contains("|| true"), "旧服务不存在也不算失败")
     check(script.contains("-lt 100"), "最多等 10 秒（100 × 0.1s）")
     check(script.contains("/bin/cat '\(Paths.startupLog)' >&2"), "失败时输出开机日志")
+    // 白名单要 admin 组可写，GUI 才能免密改它。
+    check(script.contains("/usr/sbin/chown root:admin '\(Paths.allowlist)'"), "白名单归 admin 组")
+    check(script.contains("/bin/chmod 664 '\(Paths.allowlist)'"), "白名单组可写")
+    // 目录不能放权：root 执行的 startup.sh 就在里面。
+    check(script.contains("/bin/chmod 755 '\(Paths.dataDir)'"), "目录仍只有 root 可写")
+    check(!script.contains("chmod 775 '\(Paths.dataDir)'"), "目录没有被设成组可写")
 
     // bootstrap 的 RunAtLoad 已经会加载 PF，安装脚本不能自己再并发加载一次
     // （两个 pfctl -f 撞在一起就是 DIOCXCOMMIT: Resource busy）。
     // 脚本里唯一一处加载命令，应该是被 printf 写进 startup.sh 的那份数据。
-    check(startupScript().contains(pfLoadCommand()), "开机脚本负责加载 PF")
+    check(daemonScript().contains("/sbin/pfctl -f"), "守护脚本负责加载 PF")
     // 开机脚本整体是被单引号裹起来当数据写进去的（路径里的引号会被再转义，
     // 所以不能直接 contains(pfLoadCommand())，要比对转义后的形态）。
-    check(script.contains(shellQuote(startupScript())), "开机脚本作为数据整体嵌入")
+    check(script.contains(shellQuote(daemonScript())), "守护脚本作为数据整体嵌入")
     let occurrences = script.components(separatedBy: "until /sbin/pfctl -f").count - 1
     check(occurrences == 1, "加载命令只出现一次，即嵌入的那份（实际 \(occurrences) 次）")
 }
@@ -138,6 +144,49 @@ func testToggleScripts() {
     check(enable.contains("/bin/rm -f '\(Paths.disabledMarker)'"), "清掉关闭标记")
     check(enable.contains("pfctl -e"), "必要时启用 PF")
     check(enable.contains("pfctl -F states"), "启用时清空关闭期间建立的直连")
+}
+
+// ============================================================================
+// 守护脚本与 WatchPaths
+// ============================================================================
+func testDaemonPlist() {
+    let plist = daemonPlist()
+    check(plist.contains("<key>WatchPaths</key>"), "带 WatchPaths")
+    check(plist.contains("<string>\(Paths.allowlist)</string>"), "监视白名单文件")
+    check(plist.contains("<key>RunAtLoad</key>"), "开机仍然自启")
+    // launchd 默认两次启动间隔 10 秒，不调小的话连着改白名单会卡很久。
+    check(plist.contains("<key>ThrottleInterval</key><integer>1</integer>"), "节流调到 1 秒")
+}
+
+func testDaemonScriptNeverWritesAllowlist() {
+    // 这是整个 WatchPaths 方案最致命的坑：守护脚本只要碰一下白名单，
+    // 就会把自己再次触发，无限循环烧 CPU。
+    let script = daemonScript()
+    let allowlist = shellQuote(Paths.allowlist)
+    for redirect in ["> \(allowlist)", ">> \(allowlist)",
+                     "touch \(allowlist)", "mv \(allowlist)", "tee \(allowlist)"] {
+        check(!script.contains(redirect), "守护脚本不写白名单: \(redirect)")
+    }
+    // 只读它是可以的 —— 实际上连读都不用，pfctl 自己去读 table 文件。
+    check(script.contains(shellQuote(Paths.rules)), "守护脚本加载的是 rules.conf")
+}
+
+func testDaemonScriptReportsEveryPath() {
+    let script = daemonScript()
+    // 每条退出路径都要写状态，否则 GUI 只能干等到超时。
+    check(script.contains("report fail \"白名单语法有误"), "语法错误要回报")
+    check(script.contains("report fail \"加载 PF 规则失败"), "加载失败要回报")
+    check(script.contains("report ok \"防护当前已关闭"), "已关闭状态要回报")
+    check(script.contains("report ok \"已生效"), "成功要回报")
+
+    // 用户主动关掉防护后，改白名单不应该把防护偷偷打开。
+    guard let disabledCheck = script.range(of: "if [ -f \(shellQuote(Paths.disabledMarker)) ]"),
+          let enable = script.range(of: "/sbin/pfctl -e") else {
+        check(false, "守护脚本缺少关闭标记判断或启用步骤")
+        return
+    }
+    check(disabledCheck.lowerBound < enable.lowerBound, "先判断关闭标记再谈启用")
+    check(script.contains("/bin/sleep 0.3"), "等待写入落定，避开写到一半被触发")
 }
 
 // ============================================================================
@@ -219,6 +268,9 @@ enum RulesTests {
         testInstallScript()
         testUninstallScript()
         testToggleScripts()
+        testDaemonPlist()
+        testDaemonScriptNeverWritesAllowlist()
+        testDaemonScriptReportsEveryPath()
         testAllowlistAccepts()
         testAllowlistRejects()
         testAllowlistIssueLocation()

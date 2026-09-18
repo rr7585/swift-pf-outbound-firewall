@@ -43,6 +43,32 @@ VPN 断线或分流失效时，流量不会 fallback 到物理网卡，真实 IP
 `Rules.swift` 只 import Foundation，所以 `test.sh` 能把它和测试文件一起编译成
 一个可执行文件跑掉 —— 不用装 App，也不用 root。
 
+## 权限模型
+
+日常改白名单**不需要密码**。做法是 LaunchDaemon 的 `WatchPaths` 盯着
+`allowlist.txt`，文件一变 launchd 就以 root 重跑守护脚本，由它校验并重载 PF。
+GUI 那边只干一件事：把文本写进那个文件。
+
+于是 root 侧不再接收任何来自界面的命令字符串，只读一个纯数据文件。
+
+| 操作 | 要密码吗 |
+| --- | --- |
+| 改白名单并生效 | 不要 |
+| 开启 / 关闭防护 | 要（`pfctl -e/-d` 和 `/var/run` 下的标记都归 root） |
+| 安装 / 卸载 | 要 |
+
+白名单文件是 `root:admin` `664`，所以本机管理员可写；目录本身仍是
+`root:wheel` `755` —— root 执行的 `startup.sh` 就在里面，目录一旦可写，
+谁都能把它换掉。
+
+**代价**：GUI 写文件时没有 root 帮忙先校验，所以一份语法有问题的白名单
+会真的落到磁盘上。但守护脚本加载前会 `pfctl -nf` 干跑，不通过就原样退出，
+内核里还是上一份规则 —— 也就是写错只会「没生效」，不会把网络锁死。
+界面侧本来也有逐行正则校验，这是第二道闸。
+
+**旧版安装**（第一步那版，LaunchDaemon 没有 `WatchPaths`）会在界面上显示
+一行橙色提示和「升级」按钮，点一下重跑安装脚本即可，配置不丢。
+
 ## 界面
 
 - **安装并启用 / 保存并生效** — 写白名单、校验并加载 PF 规则
@@ -58,12 +84,13 @@ VPN 断线或分流失效时，流量不会 fallback 到物理网卡，真实 IP
 | --- | --- |
 | `/Library/Application Support/PFOutboundFirewall/allowlist.txt` | 白名单 |
 | `/Library/Application Support/PFOutboundFirewall/rules.conf` | 生成的 PF 规则 |
-| `/Library/Application Support/PFOutboundFirewall/startup.sh` | 开机加载脚本 |
-| `/Library/Application Support/PFOutboundFirewall/startup.log` | 开机加载日志 |
-| `/Library/LaunchDaemons/com.user.pf-outbound.plist` | LaunchDaemon（`RunAtLoad`） |
+| `/Library/Application Support/PFOutboundFirewall/startup.sh` | 守护脚本（开机 + 白名单变更共用） |
+| `/Library/Application Support/PFOutboundFirewall/startup.log` | 守护脚本日志 |
+| `/Library/Application Support/PFOutboundFirewall/apply-status.txt` | 守护脚本每次处理完的结果，GUI 读它做反馈 |
+| `/Library/LaunchDaemons/com.user.pf-outbound.plist` | LaunchDaemon（`RunAtLoad` + `WatchPaths`） |
 | `/var/run/com.user.pf-outbound.disabled` | 关闭标记，重启后自动清空并恢复防护 |
 
-安装、保存、开关防护都需要管理员密码。
+安装、卸载、开关防护需要管理员密码；改白名单不需要。
 
 ## 实现上几个要记住的点
 
@@ -73,8 +100,21 @@ administrator privileges` 执行它。脚本路径通过 argv 传给 osascript�
 AppleScript 字面量，所以只剩 shell 一层引用要管，由 `shellQuote` 负责 ——
 白名单是用户输入，最终会落到 root 执行的脚本里，测试里专门有注入用例。
 
-**先校验再覆盖**。保存白名单时先写临时文件、用 `pfctl -nf` 干跑一遍，
-通过了才 `mv` 覆盖正式文件。跳过这步的话，一条笔误的规则就能把自己锁死。
+**守护脚本绝对不能写 `allowlist.txt`**。它是被 `WatchPaths` 监视的那个文件，
+脚本碰一下就会把自己再次触发，无限循环烧 CPU。测试里锁了这条
+（`testDaemonScriptNeverWritesAllowlist`）。同理，脚本的每条退出路径都必须写
+`apply-status.txt`，否则 GUI 只能一直等到超时。
+
+**`ThrottleInterval` 要调小**。launchd 默认同一个 job 两次启动至少隔 10 秒，
+不改的话连着存两次白名单，第二次要等十秒才生效。设成 1。
+
+**截断重写不是原子操作**。GUI 免密写白名单时不能用「临时文件 + 改名」那套
+（那需要目录可写，而目录不能放权），只能原地截断后一次写完。所以守护脚本
+开头 `sleep 0.3` 等内容落定，避开写到一半被触发。
+
+**先校验再加载**。两条保存路径都不会把没验过的规则塞进内核：免密路径由守护脚本
+在加载前 `pfctl -nf` 干跑；提权回退路径（旧版安装）则是先写临时文件、干跑通过了
+才 `mv` 覆盖正式文件。跳过这步的话，一条笔误的规则就能把自己锁死。
 
 **`block` 必须是最后一条**。pf 的 `quick` 先匹配先生效，兜底的
 `block drop out quick all` 跑到前面去就等于全断网。测试里锁了这条。
@@ -100,7 +140,10 @@ kill-switch 不应该因为你昨天临时关过就一直关着。
 sudo pfctl -s info                      # PF 是否 Enabled
 sudo pfctl -s rules                     # 当前规则
 sudo pfctl -t vpn_allowlist -T show     # 白名单表
-cat /Library/Application\ Support/PFOutboundFirewall/startup.log
+cd /Library/Application\ Support/PFOutboundFirewall
+cat startup.log        # 守护脚本上一次的完整输出
+cat apply-status.txt   # 第一行 ok/fail，第二行说明
+ls -l allowlist.txt    # 应为 -rw-rw-r-- root admin，否则免密保存走不通
 ```
 
 被锁死且界面也打不开时：
@@ -112,6 +155,7 @@ sudo launchctl bootout system/com.user.pf-outbound   # 停掉开机自启
 
 ## 与 AppleScript 原版的差异
 
+- **改白名单不再需要密码**（原版每次保存都弹授权框）
 - 启用防护从两次提权合成一次（原版 `saveAllowlist` + `enable` 各弹一次密码）
 - 原版手搓了一整套 `configureMainMenu` 才让 ⌘C/⌘V 能用，SwiftUI 自带标准编辑菜单，全删了
 - 原版为了能在脚本编辑器里调试，带了一整条 `editorHostMode` 模态分支，不再需要

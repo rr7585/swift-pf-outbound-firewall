@@ -15,6 +15,8 @@ enum Paths {
     static let startup = dataDir + "/startup.sh"
     static let installMarker = dataDir + "/installed.ok"
     static let startupLog = dataDir + "/startup.log"
+    /// 守护进程每次处理完写在这里，GUI 靠它知道免密保存到底生效没有。
+    static let applyStatus = dataDir + "/apply-status.txt"
     // /var/run 重启后清空；开机任务会重新开启 PF，所以“已关闭”不应跨重启保留。
     static let disabledMarker = "/var/run/com.user.pf-outbound.disabled"
     static let daemonPlist = "/Library/LaunchDaemons/com.user.pf-outbound.plist"
@@ -58,10 +60,13 @@ func pfRules(allowlistPath: String) -> String {
 
 /// macOS 偶尔有别的系统服务短暂占着 PF 事务锁，直接 -f 会报
 /// DIOCXCOMMIT: Resource busy；重试十次基本都能过去。
-func pfLoadCommand(rulesPath: String = Paths.rules) -> String {
+///
+/// onFailure 是重试耗尽后要执行的语句。守护脚本要在这里补一条状态记录，
+/// 别的地方直接退出就行。整条命令是单个 shell 语句，可以塞进一行脚本里。
+func pfLoadCommand(rulesPath: String = Paths.rules, onFailure: String = "exit 1") -> String {
     "attempt=0; until /sbin/pfctl -f \(shellQuote(rulesPath)); do "
         + "attempt=$((attempt + 1)); "
-        + "if [ \"$attempt\" -ge 10 ]; then exit 1; fi; "
+        + "if [ \"$attempt\" -ge 10 ]; then \(onFailure); fi; "
         + "/bin/sleep 0.2; done"
 }
 
@@ -86,7 +91,10 @@ func saveScript(listText: String, apply: Bool) -> String {
         "/bin/mv \(shellQuote(tempList)) \(shellQuote(Paths.allowlist))",
         shellWrite(pfRules(allowlistPath: Paths.allowlist), to: Paths.rules),
         "/bin/rm -f \(shellQuote(tempRules))",
-        "/bin/chmod 644 \(shellQuote(Paths.allowlist))",
+        // mv 会把临时文件的属主权限带过来，这里补回 admin 组可写，
+        // 否则一次提权保存之后免密保存就失效了。
+        "/usr/sbin/chown root:admin \(shellQuote(Paths.allowlist))",
+        "/bin/chmod 664 \(shellQuote(Paths.allowlist))",
         "/bin/chmod 600 \(shellQuote(Paths.rules))",
     ]
     if apply {
@@ -96,20 +104,57 @@ func saveScript(listText: String, apply: Bool) -> String {
     return lines.joined(separator: "\n") + "\n"
 }
 
-/// 开机加载脚本，由 LaunchDaemon 以 root 执行。
-/// 全程输出重定向到 startup.log，安装失败时 GUI 会把它读出来显示。
-func startupScript() -> String {
-    """
+/// 守护脚本，由 LaunchDaemon 以 root 执行。两种触发方式共用同一份逻辑：
+///
+/// - `RunAtLoad`：开机时加载规则并启用 PF
+/// - `WatchPaths`：白名单文件一变就重新加载
+///
+/// 后者是免密保存的关键 —— GUI 只要能写 allowlist.txt，剩下的 root 活由
+/// 这个脚本干，界面侧一次 pfctl 都不用碰。
+///
+/// 两条铁律：
+/// 1. **绝对不能写 allowlist.txt**，否则会把自己再次触发，无限循环。
+/// 2. 每条退出路径都要写 apply-status.txt，否则 GUI 只能一直等到超时。
+func daemonScript() -> String {
+    let statusPath = shellQuote(Paths.applyStatus)
+    let statusTempPath = shellQuote(Paths.applyStatus + ".new")
+    let loadRules = pfLoadCommand(onFailure: "report fail \"加载 PF 规则失败\"; exit 1")
+    return """
     #!/bin/sh
     exec > \(shellQuote(Paths.startupLog)) 2>&1
-    set -e
-    /bin/rm -f \(shellQuote(Paths.installMarker))
-    /sbin/pfctl -nf \(shellQuote(Paths.rules))
-    \(pfLoadCommand())
-    if ! /sbin/pfctl -s info 2>/dev/null | /usr/bin/grep -q '^Status: Enabled'; then /sbin/pfctl -e; fi
+    echo "=== $(/bin/date) ==="
+
+    # WatchPaths 可能在 GUI 还没写完时就触发（截断+写入不是原子操作），
+    # 停一下让内容落定再读。开机那条路径上这 0.3 秒无所谓。
+    /bin/sleep 0.3
+
+    # 每条路径都要落状态，GUI 靠 apply-status.txt 的 mtime 变化判断处理完了。
+    report() {
+        /usr/bin/printf '%s\\n%s\\n' "$1" "$2" > \(statusTempPath)
+        /bin/mv \(statusTempPath) \(statusPath)
+        /bin/chmod 644 \(statusPath)
+    }
+
+    # 先干跑校验。不通过就原样退出 —— 内核里还是上一份规则，
+    # 也就是说白名单写错了只会“没生效”，不会把网络锁死。
+    if ! /sbin/pfctl -nf \(shellQuote(Paths.rules)); then
+        report fail "白名单语法有误，已保持原有规则"
+        exit 1
+    fi
+
+    # 用户主动关过防护，这时改白名单只存不加载，不把防护偷偷打开。
+    if [ -f \(shellQuote(Paths.disabledMarker)) ]; then
+        report ok "防护当前已关闭，白名单已保存但未加载"
+        exit 0
+    fi
+
+    \(loadRules)
+    if ! /sbin/pfctl -s info 2>/dev/null | /usr/bin/grep -q '^Status: Enabled'; then
+        /sbin/pfctl -e
+    fi
     /sbin/pfctl -F states
-    /bin/rm -f \(shellQuote(Paths.disabledMarker))
     /usr/bin/touch \(shellQuote(Paths.installMarker))
+    report ok "已生效"
 
     """
 }
@@ -122,6 +167,8 @@ func daemonPlist() -> String {
     <key>Label</key><string>\(Paths.serviceID)</string>
     <key>ProgramArguments</key><array><string>/bin/sh</string><string>\(Paths.startup)</string></array>
     <key>RunAtLoad</key><true/>
+    <key>WatchPaths</key><array><string>\(Paths.allowlist)</string></array>
+    <key>ThrottleInterval</key><integer>1</integer>
     </dict></plist>
 
     """
@@ -140,9 +187,13 @@ func installScript() -> String {
         "/bin/rm -f \(shellQuote(Paths.installMarker))",
         "/usr/bin/touch \(shellQuote(Paths.allowlist))",
         shellWrite(pfRules(allowlistPath: Paths.allowlist), to: Paths.rules),
-        "/bin/chmod 644 \(shellQuote(Paths.allowlist))",
+        // 白名单交给 admin 组可写，GUI 就能免密改它，由 WatchPaths 触发重载。
+        // 目录本身保持 root:wheel 755 —— root 执行的 startup.sh 就在里面，
+        // 目录一旦可写，任何人都能把它换掉。
+        "/usr/sbin/chown root:admin \(shellQuote(Paths.allowlist))",
+        "/bin/chmod 664 \(shellQuote(Paths.allowlist))",
         "/bin/chmod 600 \(shellQuote(Paths.rules))",
-        shellWrite(startupScript(), to: Paths.startup),
+        shellWrite(daemonScript(), to: Paths.startup),
         "/bin/chmod 700 \(shellQuote(Paths.startup))",
         shellWrite(daemonPlist(), to: Paths.daemonPlist),
         "/bin/chmod 644 \(shellQuote(Paths.daemonPlist))",

@@ -98,6 +98,79 @@ func readAllowlist() -> String {
     (try? String(contentsOfFile: Paths.allowlist, encoding: .utf8)) ?? ""
 }
 
+/// 这次安装是不是带 WatchPaths 的新版。
+/// 旧版（第一步那版）装好的 LaunchDaemon 没有这个键，也没把白名单设成
+/// admin 组可写，免密保存走不通，得重新安装一次才能升级。
+func installSupportsWatchPaths() -> Bool {
+    guard let text = try? String(contentsOfFile: Paths.daemonPlist, encoding: .utf8) else {
+        return false
+    }
+    return text.contains("<key>WatchPaths</key>")
+}
+
+// ============================================================================
+// 免密保存
+// ============================================================================
+
+/// 守护进程处理完一次变更后写下的结果。
+struct ApplyStatus {
+    let ok: Bool
+    let detail: String
+}
+
+private func applyStatusModified() -> Date? {
+    let attributes = try? FileManager.default.attributesOfItem(atPath: Paths.applyStatus)
+    return attributes?[.modificationDate] as? Date
+}
+
+private func readApplyStatus() -> ApplyStatus? {
+    guard let text = try? String(contentsOfFile: Paths.applyStatus, encoding: .utf8) else {
+        return nil
+    }
+    var lines = text.components(separatedBy: "\n")
+    let verdict = lines.isEmpty ? "" : lines.removeFirst()
+    let detail = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    return ApplyStatus(ok: verdict.hasPrefix("ok"), detail: detail)
+}
+
+/// 原地截断重写白名单，不走提权。
+///
+/// 不用「写临时文件再改名」那套原子写法：那需要目录可写，而目录里放着
+/// root 要执行的 startup.sh，不能松权限。所以这里直接截断后一次写完，
+/// 守护脚本那边有 0.3 秒的等待来避开写到一半被触发。
+private func writeAllowlistDirectly(_ text: String) throws {
+    guard let handle = FileHandle(forWritingAtPath: Paths.allowlist) else {
+        throw FirewallError.failed("无法写入白名单文件")
+    }
+    defer { try? handle.close() }
+    do {
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data(text.utf8))
+    } catch {
+        throw FirewallError.failed("写入白名单失败：\(error.localizedDescription)")
+    }
+}
+
+/// 免密保存：写文件 → 等 WatchPaths 触发的守护进程回报结果。
+///
+/// 超时返回 nil，调用方按「已保存，但没等到确认」处理 —— 不要当成失败，
+/// 因为文件确实已经写进去了，守护进程只是慢了。
+func saveAllowlistWithoutPassword(_ text: String, timeout: TimeInterval = 8) throws -> ApplyStatus? {
+    let before = applyStatusModified()
+    try writeAllowlistDirectly(text)
+
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.1)
+        let now = applyStatusModified()
+        // 首次运行时 before 是 nil，文件一出现就算处理过了。
+        if let now, before == nil || now != before {
+            return readApplyStatus()
+        }
+    }
+    return nil
+}
+
 // ============================================================================
 // 操作
 // ============================================================================
@@ -119,7 +192,15 @@ func disableProtection() throws {
 }
 
 /// 开启防护前先把当前编辑框内容落盘（但不加载），再一次性加载并启用。
-/// 合成一个脚本执行，用户只需要输一次密码。
+///
+/// 新版安装下白名单可以免密写，于是只剩启用这一步要密码；
+/// 旧版安装退回到「保存+启用」合成一个提权脚本，同样只输一次。
 func enableProtection(listText: String) throws {
-    try runAdmin(saveScript(listText: listText, apply: false) + enableScript())
+    let wroteWithoutPassword = installSupportsWatchPaths()
+        && (try? writeAllowlistDirectly(listText)) != nil
+    if wroteWithoutPassword {
+        try runAdmin(enableScript())
+    } else {
+        try runAdmin(saveScript(listText: listText, apply: false) + enableScript())
+    }
 }
