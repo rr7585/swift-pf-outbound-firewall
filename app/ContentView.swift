@@ -16,6 +16,8 @@ struct AlertBox: Identifiable {
 @MainActor
 final class Model: ObservableObject {
     @Published var listText = readAllowlist()
+    /// 磁盘上那份，用来判断有没有未保存的改动。
+    @Published private(set) var savedListText = readAllowlist()
     @Published var installed = isInstalled()
     @Published var protected = isProtected()
     @Published var busy = false
@@ -82,6 +84,8 @@ final class Model: ObservableObject {
         if !installed { return .secondary }
         return protected ? .green : .orange
     }
+
+    var hasUnsavedChanges: Bool { installed && listText != savedListText }
 
     /// 排掉空行和注释，只数真正生效的条目。
     var validEntryCount: Int {
@@ -171,6 +175,19 @@ final class Model: ObservableObject {
         run("正在升级安装 …", reloadList: true) {
             try installAndEnable()
             return "已升级，之后改白名单不再需要密码"
+        }
+    }
+
+    /// 操作结果提示几秒后自动消失 —— 一直挂在那里会让人分不清是刚发生的还是上一次的。
+    private var noteToken = 0
+    private func showNote(_ text: String) {
+        note = text
+        guard !text.isEmpty else { return }
+        noteToken += 1
+        let token = noteToken
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            if self.noteToken == token { self.note = "" }
         }
     }
 
@@ -277,8 +294,11 @@ final class Model: ObservableObject {
                 if let message {
                     self.alert = AlertBox(title: "操作失败", message: message)
                 } else {
-                    self.note = result ?? ""
-                    if reloadList { self.listText = readAllowlist() }
+                    self.showNote(result ?? "")
+                    // savedListText 始终以磁盘为准：启用防护也会把编辑框内容写盘，
+                    // 只在 reloadList 时更新的话，那条路径上「未保存」状态会一直挂着。
+                    self.savedListText = readAllowlist()
+                    if reloadList { self.listText = self.savedListText }
                 }
             }
         }
@@ -288,6 +308,37 @@ final class Model: ObservableObject {
 // ============================================================================
 // 界面
 // ============================================================================
+
+/// 首次打开时把窗口设成一个合适的大小。
+///
+/// SwiftUI 那几套办法在这个视图组合下都不生效 —— `.defaultSize`、
+/// `.frame(idealHeight:)` 都被忽略，窗口一开就是内容推导出来的高度（实测 812pt，
+/// 而内容真正需要的只有 430pt）。与其继续猜框架的行为，不如直接设一次。
+///
+/// 只在「这台机器上第一次打开」时设一次，之后交给系统记忆，
+/// 免得把用户自己拖过的尺寸覆盖掉。
+///
+/// 判断方式是自己记一个标记，不去读 AppKit 的 NSWindow Frame 键 ——
+/// 这个回调跑的时候 SwiftUI 还没给窗口分配 frameAutosaveName，
+/// 拿空名字去拼键名永远读不到值，结果每次启动都会覆盖用户的尺寸。
+private struct WindowConfigurator: NSViewRepresentable {
+    static let appliedKey = "didApplyDefaultWindowSize"
+    let defaultSize: CGSize
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            guard let window = view.window,
+                  !UserDefaults.standard.bool(forKey: Self.appliedKey) else { return }
+            UserDefaults.standard.set(true, forKey: Self.appliedKey)
+            window.setContentSize(defaultSize)
+            window.center()
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
 
 /// 系统设置那种「浅灰底 + 圆角白卡片」的分组外观。
 /// 不用 SwiftUI 的 Form(.grouped)：它底层是 AppKit 的，ImageRenderer 离屏
@@ -312,6 +363,7 @@ private struct Card<Content: View>: View {
 
 struct ContentView: View {
     @ObservedObject var model: Model
+    @State private var showConnectionHelp = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -320,14 +372,6 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 18) {
                 Card { statusRow }
                 if model.installed {
-                    Picker("", selection: $model.panel) {
-                        ForEach(Model.Panel.allCases) { Text($0.title).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(maxWidth: 240)
-                    .frame(maxWidth: .infinity, alignment: .center)
-
                     switch model.panel {
                     case .allowlist:
                         allowlistSection
@@ -346,8 +390,21 @@ struct ContentView: View {
             Divider()
             actionBar
         }
-        .frame(minWidth: 540, minHeight: model.installed ? 500 : 300)
+        .frame(minWidth: 540, minHeight: model.installed ? 430 : 300)
+        .background(WindowConfigurator(defaultSize: CGSize(width: 620, height: 500)))
         .disabled(model.busy)
+        .toolbar {
+            if model.installed {
+                ToolbarItem(placement: .principal) {
+                    Picker("", selection: $model.panel) {
+                        ForEach(Model.Panel.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 200)
+                }
+            }
+        }
         .alert(item: $model.alert) { box in
             Alert(title: Text(box.title), message: Text(box.message),
                   dismissButton: .default(Text("好")))
@@ -408,8 +465,19 @@ struct ContentView: View {
             // NSTextView 的 textContainerInset 去做，观感更接近系统设置。
             Card(padding: 0) {
                 AllowlistEditor(text: $model.listText, highlight: $model.highlight)
-                    .frame(minHeight: 170, maxHeight: .infinity)
+                    .frame(minHeight: 140, maxHeight: .infinity)
                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(alignment: .topLeading) {
+                        // 空列表时给个方向，别让用户对着一片空白猜格式
+                        if model.listText.isEmpty {
+                            Text("还没有任何地址，例如：\n203.0.113.10\n2606:4700::/32")
+                                .font(.system(.callout, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .padding(.leading, 17)
+                                .padding(.top, 13)
+                                .allowsHitTesting(false)
+                        }
+                    }
             }
 
             Text("每行一个 IP 或网段，IPv4 与 IPv6 均可，# 开头为注释。"
@@ -432,6 +500,30 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
+                    showConnectionHelp.toggle()
+                } label: {
+                    Image(systemName: "info.circle")
+                }
+                .buttonStyle(.borderless)
+                .help("这个列表能看到什么")
+                .popover(isPresented: $showConnectionHelp, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("这个列表能看到什么").font(.headline)
+                        Text("进程归属靠 lsof 快照推断 —— pf 工作在数据包层，"
+                             + "内核里没有「进程」这个概念。因此：")
+                            .fixedSize(horizontal: false, vertical: true)
+                        Label("只能看到当前用户的进程，root 运行的系统守护进程看不到",
+                              systemImage: "person.crop.circle")
+                        Label("短连接可能在两次采样之间就结束了", systemImage: "timer")
+                        Label("已经被阻断的连接建不起来，通常不会出现在这里",
+                              systemImage: "xmark.octagon")
+                    }
+                    .font(.callout)
+                    .padding(16)
+                    .frame(width: 330)
+                }
+
+                Button {
                     model.refreshConnections()
                 } label: {
                     Image(systemName: "arrow.clockwise")
@@ -442,6 +534,15 @@ struct ContentView: View {
             .padding(.horizontal, 4)
 
             Card(padding: 0) {
+                if model.connections.isEmpty {
+                    VStack(spacing: 6) {
+                        Image(systemName: "antenna.radiowaves.left.and.right.slash")
+                            .font(.system(size: 26))
+                            .foregroundStyle(.tertiary)
+                        Text("没有检测到出站连接").foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 200)
+                } else {
                 Table(model.connections) {
                     TableColumn("应用") { row in
                         HStack(spacing: 5) {
@@ -478,13 +579,12 @@ struct ContentView: View {
                     .width(56)
                 }
                 .frame(minHeight: 200)
+                }
             }
 
-            Text("按判定排序，会被阻断的排在最前。只能看到当前用户的进程 —— "
-                 + "系统守护进程需要管理员权限才可见。短连接可能在两次采样之间就结束了。")
+            Text("每 3 秒刷新，会被阻断的排在最前。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
                 .padding(.leading, 4)
         }
         .onAppear { model.setConnectionPolling(true) }
@@ -598,10 +698,14 @@ struct ContentView: View {
                 Label(model.note, systemImage: "checkmark.circle.fill")
                     .font(.callout).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.tail)
+                    .transition(.opacity)
+            } else if model.hasUnsavedChanges {
+                Text("有未保存的更改").font(.callout).foregroundStyle(.secondary)
             }
 
             Button(model.installed ? "保存并生效" : "安装并启用") { model.saveOrInstall() }
                 .keyboardShortcut(.defaultAction)
+                .disabled(model.installed && !model.hasUnsavedChanges)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)

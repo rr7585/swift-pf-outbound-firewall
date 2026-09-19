@@ -51,6 +51,13 @@ enum Render {
             snapshot("1-未安装", width: 560, height: 300, into: dir) { m in
                 m.installed = false; m.protected = false; m.listText = ""
             }
+            snapshot("8-白名单为空", width: 560, height: 440, into: dir) { m in
+                m.installed = true; m.protected = true; m.listText = ""
+            }
+            snapshot("9-有未保存改动", width: 560, height: 440, into: dir) { m in
+                m.installed = true; m.protected = true
+                m.listText = sample + "\n8.8.8.8"
+            }
             snapshot("2-防护开启", width: 560, height: 480, into: dir) { m in
                 m.installed = true; m.protected = true; m.listText = sample
             }

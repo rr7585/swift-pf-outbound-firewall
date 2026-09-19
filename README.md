@@ -262,10 +262,18 @@ kill-switch 不应该因为你昨天临时关过就一直关着。
 **图标要留白**。Big Sur 之后的 App 图标不铺满画布：1024 的画布里圆角方块只占 824，
 四周留白。铺满的话图标在 Dock 里会比旁边的大一圈，非常显眼。
 
-**窗口尺寸别用 `.windowResizability(.contentMinSize)`**。它把窗口最小尺寸钉在
-内容最小尺寸上，而 `AllowlistEditor` 包着的 NSScrollView 会报一个很大的固有尺寸，
-最小宽度会变成 900pt，小屏上缩不小。更隐蔽的是「未安装」状态下编辑器压根没显示，
-`if/else` 的另一个分支照样参与这个计算。
+**窗口尺寸最后是自己设的**。SwiftUI 那几套办法在这个视图组合下都不生效：
+`.windowResizability(.contentMinSize)` 会把最小宽度钉到 900pt（`AllowlistEditor`
+包着的 NSScrollView 报了个很大的固有尺寸，而且「未安装」状态下它压根没显示、
+`if/else` 的另一个分支照样参与计算）；去掉之后 `.defaultSize` 和
+`.frame(idealHeight:)` 又都被忽略，窗口一开就是 812pt 高，而内容真正需要的只有
+430pt（`NSHostingView.fittingSize` 量的）。
+
+最后用 `WindowConfigurator` 在首次打开时直接 `setContentSize` 一次，
+之后交给系统记忆。判断「是不是第一次」要用自己记的标记，
+不能去读 AppKit 的 `NSWindow Frame` 键 —— 那个回调跑的时候 SwiftUI 还没给窗口
+分配 `frameAutosaveName`，拿空名字拼出来的键永远读不到值，
+结果每次启动都会覆盖用户拖过的尺寸。
 
 ## 排障
 
