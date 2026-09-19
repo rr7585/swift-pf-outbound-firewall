@@ -613,27 +613,45 @@ struct ContentView: View {
     // 高级选项
     // ------------------------------------------------------------------
     private var advancedSection: some View {
-        DisclosureGroup(isExpanded: $model.showAdvanced) {
-            Card(padding: 0) {
-                VStack(spacing: 0) {
-                    optionRow(title: "允许局域网访问",
-                              detail: "放行 10/8、172.16/12、192.168/16 私有网段，"
-                                    + "用于访问路由器后台、NAS 等设备",
-                              isOn: $model.options.allowLAN)
-                    Divider().padding(.leading, 16)
-                    optionRow(title: "允许 DHCP 广播",
-                              detail: "放行 255.255.255.255，"
-                                    + "否则租约到期或重连 Wi-Fi 时可能拿不到 IP 地址",
-                              isOn: $model.options.allowDHCP)
+        // 不用 DisclosureGroup：macOS 上它只有那个小三角是热区，
+        // 点标题文字没反应，整行更是点不动。自己拼一个整行可点的。
+        VStack(alignment: .leading, spacing: 7) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { model.showAdvanced.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.bold))
+                        .rotationEffect(.degrees(model.showAdvanced ? 90 : 0))
+                    Text("高级选项").font(.subheadline.weight(.medium))
+                    Spacer(minLength: 0)
                 }
-            }
-            .padding(.top, 7)
-        } label: {
-            Text("高级选项")
-                .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
+                .padding(.vertical, 4)
+                .padding(.horizontal, 4)
+                // 整块矩形都算热区，不然只有文字和图标本身能点
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(model.showAdvanced ? "收起高级选项" : "展开高级选项")
+
+            if model.showAdvanced {
+                Card(padding: 0) {
+                    VStack(spacing: 0) {
+                        optionRow(title: "允许局域网访问",
+                                  detail: "放行 10/8、172.16/12、192.168/16 私有网段，"
+                                        + "用于访问路由器后台、NAS 等设备",
+                                  isOn: $model.options.allowLAN)
+                        Divider().padding(.leading, 16)
+                        optionRow(title: "允许 DHCP 广播",
+                                  detail: "放行 255.255.255.255，"
+                                        + "否则租约到期或重连 Wi-Fi 时可能拿不到 IP 地址",
+                                  isOn: $model.options.allowDHCP)
+                    }
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
-        .padding(.leading, 4)
     }
 
     private func optionRow(title: String, detail: String, isOn: Binding<Bool>) -> some View {
